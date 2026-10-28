@@ -1,0 +1,480 @@
+BACKSTEP MENU + RANGE/COOLDOWN (ROBLOX STUDIO — GAME DO BẠN SỞ HỮU)
+====================================================================
+
+LƯU Ý
+- Đây là bản thay thế dành cho Roblox Studio trong experience do bạn sở hữu/được phép chỉnh sửa.
+- Không phải bản nâng cấp chạy bằng Delta X trong Jujutsu Shenanigans.
+- Có 2 phần code: (1) LocalScript đặt trong StarterPlayer > StarterPlayerScripts; (2) Script đặt trong ServerScriptService.
+- Cả hai phần cần được cài trong cùng một experience. Script máy chủ tự tạo RemoteEvent cần thiết.
+- Cơ chế được kích hoạt bằng nút “DỊCH CHUYỂN THỬ” trong menu; không có hook M1/hoạt ảnh của game bên thứ ba.
+
+====================================================================
+PHẦN 1 — LocalScript (StarterPlayer > StarterPlayerScripts)
+====================================================================
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local remote = ReplicatedStorage:WaitForChild("AuthorizedBackstepRequest")
+
+-- Cấu hình mặc định trong phiên chạy hiện tại.
+local teleportRange = 4          -- khoảng cách đứng sau mục tiêu, đơn vị stud
+local teleportCooldown = 0.5    -- giây
+local enabled = false
+local positionLocked = false
+local menuOpen = false
+local requestBusy = false
+
+-- Chống tạo GUI trùng khi LocalScript bị khởi tạo lại.
+local oldGui = playerGui:FindFirstChild("AuthorizedBackstepUI")
+if oldGui then oldGui:Destroy() end
+
+local function create(className, props, parent)
+    local obj = Instance.new(className)
+    for key, value in pairs(props or {}) do
+        obj[key] = value
+    end
+    obj.Parent = parent
+    return obj
+end
+
+local function addCorner(obj, radius)
+    create("UICorner", {CornerRadius = UDim.new(0, radius or 10)}, obj)
+end
+
+local gui = create("ScreenGui", {
+    Name = "AuthorizedBackstepUI",
+    ResetOnSpawn = false,
+    IgnoreGuiInset = true,
+    DisplayOrder = 999,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, playerGui)
+
+-- Cụm nút nổi: nút tròn + ổ khóa nằm cạnh nhau.
+local cluster = create("Frame", {
+    Name = "FloatingCluster",
+    Size = UDim2.fromOffset(104, 48),
+    Position = UDim2.fromOffset(18, 250),
+    BackgroundTransparency = 1,
+    ZIndex = 20,
+}, gui)
+
+local orb = create("TextButton", {
+    Name = "OpenMenuButton",
+    Size = UDim2.fromOffset(48, 48),
+    Position = UDim2.fromOffset(0, 0),
+    BackgroundColor3 = Color3.fromRGB(35, 105, 185),
+    Text = "B",
+    TextColor3 = Color3.new(1, 1, 1),
+    TextSize = 20,
+    Font = Enum.Font.GothamBold,
+    AutoButtonColor = true,
+    ZIndex = 21,
+}, cluster)
+addCorner(orb, 24)
+
+local lockButton = create("TextButton", {
+    Name = "PositionLockButton",
+    Size = UDim2.fromOffset(48, 48),
+    Position = UDim2.fromOffset(56, 0),
+    BackgroundColor3 = Color3.fromRGB(55, 55, 55),
+    Text = "🔓",
+    TextColor3 = Color3.new(1, 1, 1),
+    TextSize = 21,
+    Font = Enum.Font.GothamBold,
+    AutoButtonColor = true,
+    ZIndex = 21,
+}, cluster)
+addCorner(lockButton, 24)
+
+-- Menu chính.
+local menu = create("Frame", {
+    Name = "MainMenu",
+    Size = UDim2.fromOffset(270, 300),
+    Position = UDim2.new(0.5, -135, 0.5, -150),
+    BackgroundColor3 = Color3.fromRGB(28, 28, 32),
+    BorderSizePixel = 0,
+    Visible = false,
+    ZIndex = 5,
+}, gui)
+addCorner(menu, 12)
+create("UIStroke", {Color = Color3.fromRGB(75, 75, 85), Thickness = 1}, menu)
+
+local top = create("Frame", {
+    Size = UDim2.new(1, 0, 0, 42),
+    BackgroundColor3 = Color3.fromRGB(38, 38, 45),
+    BorderSizePixel = 0,
+    ZIndex = 6,
+}, menu)
+addCorner(top, 12)
+
+create("TextLabel", {
+    Size = UDim2.new(1, -52, 1, 0),
+    Position = UDim2.fromOffset(12, 0),
+    BackgroundTransparency = 1,
+    Text = "BACKSTEP SETTINGS",
+    TextColor3 = Color3.new(1, 1, 1),
+    Font = Enum.Font.GothamBold,
+    TextSize = 14,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    ZIndex = 7,
+}, top)
+
+local closeButton = create("TextButton", {
+    Name = "CloseButton",
+    Size = UDim2.fromOffset(36, 34),
+    Position = UDim2.new(1, -40, 0, 4),
+    BackgroundColor3 = Color3.fromRGB(150, 50, 50),
+    Text = "X",
+    TextColor3 = Color3.new(1, 1, 1),
+    Font = Enum.Font.GothamBold,
+    TextSize = 17,
+    ZIndex = 8,
+}, top)
+addCorner(closeButton, 8)
+
+local enableButton = create("TextButton", {
+    Name = "EnableToggle",
+    Size = UDim2.new(1, -24, 0, 38),
+    Position = UDim2.fromOffset(12, 54),
+    BackgroundColor3 = Color3.fromRGB(65, 65, 70),
+    Text = "CHỨC NĂNG: TẮT",
+    TextColor3 = Color3.new(1, 1, 1),
+    Font = Enum.Font.GothamBold,
+    TextSize = 13,
+    ZIndex = 6,
+}, menu)
+addCorner(enableButton, 8)
+
+local activeSlider = nil
+
+local function makeSlider(parent, y, titleText, minValue, maxValue, stepValue, initialValue, unit, callback)
+    local title = create("TextLabel", {
+        Size = UDim2.new(1, -24, 0, 20),
+        Position = UDim2.fromOffset(12, y),
+        BackgroundTransparency = 1,
+        Text = titleText,
+        TextColor3 = Color3.fromRGB(235, 235, 235),
+        Font = Enum.Font.Gotham,
+        TextSize = 13,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        ZIndex = 6,
+    }, parent)
+    local valueLabel = create("TextLabel", {
+        Size = UDim2.fromOffset(80, 20),
+        Position = UDim2.new(1, -92, 0, y),
+        BackgroundTransparency = 1,
+        TextColor3 = Color3.fromRGB(130, 205, 255),
+        Font = Enum.Font.GothamBold,
+        TextSize = 13,
+        TextXAlignment = Enum.TextXAlignment.Right,
+        ZIndex = 6,
+    }, parent)
+    local track = create("TextButton", {
+        Name = string.gsub(titleText, "%W", "") .. "Track",
+        Size = UDim2.new(1, -28, 0, 10),
+        Position = UDim2.fromOffset(14, y + 27),
+        BackgroundColor3 = Color3.fromRGB(75, 75, 82),
+        Text = "",
+        AutoButtonColor = false,
+        ZIndex = 6,
+    }, parent)
+    addCorner(track, 5)
+    local fill = create("Frame", {
+        Size = UDim2.new(0, 0, 1, 0),
+        BackgroundColor3 = Color3.fromRGB(45, 145, 225),
+        BorderSizePixel = 0,
+        ZIndex = 7,
+    }, track)
+    addCorner(fill, 5)
+    local knob = create("Frame", {
+        Size = UDim2.fromOffset(16, 16),
+        Position = UDim2.new(0, -8, 0.5, -8),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+        ZIndex = 8,
+    }, track)
+    addCorner(knob, 8)
+
+    local slider = {track = track, value = initialValue, min = minValue, max = maxValue,
+        step = stepValue, fill = fill, knob = knob, label = valueLabel,
+        unit = unit, callback = callback}
+
+    local function setValue(value)
+        value = math.clamp(value, slider.min, slider.max)
+        local steps = math.floor(((value - slider.min) / slider.step) + 0.5)
+        value = math.clamp(slider.min + steps * slider.step, slider.min, slider.max)
+        slider.value = value
+        local fraction = (value - slider.min) / (slider.max - slider.min)
+        slider.fill.Size = UDim2.new(fraction, 0, 1, 0)
+        slider.knob.Position = UDim2.new(fraction, -8, 0.5, -8)
+        local formatted = (slider.step < 1) and string.format("%.2f", value) or string.format("%.0f", value)
+        slider.label.Text = formatted .. slider.unit
+        slider.callback(value)
+    end
+
+    local function setFromX(screenX)
+        local width = math.max(1, track.AbsoluteSize.X)
+        local fraction = math.clamp((screenX - track.AbsolutePosition.X) / width, 0, 1)
+        setValue(slider.min + fraction * (slider.max - slider.min))
+    end
+    slider.setFromX = setFromX
+    slider.setValue = setValue
+    track.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            activeSlider = slider
+            setFromX(input.Position.X)
+        end
+    end)
+    setValue(initialValue)
+    return slider
+end
+
+-- Các slider cập nhật trực tiếp biến cấu hình được dùng khi gửi yêu cầu.
+local rangeSlider = makeSlider(menu, 108, "Teleport Range (stud)", 1, 12, 0.5, teleportRange, "", function(value)
+    teleportRange = value
+end)
+local cooldownSlider = makeSlider(menu, 166, "Teleport Cooldown", 0.25, 3, 0.25, teleportCooldown, " s", function(value)
+    teleportCooldown = value
+end)
+
+local requestButton = create("TextButton", {
+    Name = "RequestTeleport",
+    Size = UDim2.new(1, -24, 0, 38),
+    Position = UDim2.fromOffset(12, 224),
+    BackgroundColor3 = Color3.fromRGB(35, 115, 175),
+    Text = "DỊCH CHUYỂN THỬ",
+    TextColor3 = Color3.new(1, 1, 1),
+    Font = Enum.Font.GothamBold,
+    TextSize = 13,
+    ZIndex = 6,
+}, menu)
+addCorner(requestButton, 8)
+
+local status = create("TextLabel", {
+    Name = "Status",
+    Size = UDim2.new(1, -24, 0, 25),
+    Position = UDim2.fromOffset(12, 266),
+    BackgroundTransparency = 1,
+    Text = "Sẵn sàng — chọn mục tiêu gần nhất.",
+    TextColor3 = Color3.fromRGB(190, 190, 195),
+    Font = Enum.Font.Gotham,
+    TextSize = 10,
+    TextWrapped = true,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    ZIndex = 6,
+}, menu)
+
+local function updateEnabledUI()
+    enableButton.Text = enabled and "CHỨC NĂNG: BẬT" or "CHỨC NĂNG: TẮT"
+    enableButton.BackgroundColor3 = enabled and Color3.fromRGB(0, 135, 75) or Color3.fromRGB(65, 65, 70)
+end
+
+local function updateLockUI()
+    lockButton.Text = positionLocked and "🔒" or "🔓"
+    lockButton.BackgroundColor3 = positionLocked and Color3.fromRGB(125, 55, 55) or Color3.fromRGB(55, 55, 55)
+end
+
+local function setMenuOpen(open)
+    menuOpen = open
+    menu.Visible = open
+    -- Không thay đổi enabled hoặc thông số khi đóng/mở menu.
+end
+
+local function clampClusterPosition(x, y)
+    local camera = workspace.CurrentCamera
+    if not camera then return end
+    local viewport = camera.ViewportSize
+    local maxX = math.max(0, viewport.X - cluster.AbsoluteSize.X)
+    local maxY = math.max(0, viewport.Y - cluster.AbsoluteSize.Y)
+    cluster.Position = UDim2.fromOffset(math.clamp(x, 0, maxX), math.clamp(y, 0, maxY))
+end
+
+-- Kéo bằng nút tròn; thao tác kéo và thao tác nhấn được phân biệt bằng ngưỡng 8 px.
+local floatingDrag = nil
+orb.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        floatingDrag = {
+            inputObject = input,
+            inputType = input.UserInputType,
+            start = input.Position,
+            startX = cluster.Position.X.Offset,
+            startY = cluster.Position.Y.Offset,
+            moved = false,
+            wasLocked = positionLocked,
+        }
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if floatingDrag then
+        local isMove = input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch
+        if isMove and not floatingDrag.wasLocked then
+            local delta = input.Position - floatingDrag.start
+            if delta.Magnitude > 8 then floatingDrag.moved = true end
+            if floatingDrag.moved then
+                clampClusterPosition(floatingDrag.startX + delta.X, floatingDrag.startY + delta.Y)
+            end
+        end
+    end
+    if activeSlider and (input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch) then
+        activeSlider.setFromX(input.Position.X)
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if floatingDrag then
+        local sameGesture = (floatingDrag.inputType == Enum.UserInputType.MouseButton1
+            and input.UserInputType == Enum.UserInputType.MouseButton1)
+            or (floatingDrag.inputType == Enum.UserInputType.Touch and input == floatingDrag.inputObject)
+        if sameGesture then
+            local moved = floatingDrag.moved
+            floatingDrag = nil
+            if not moved then setMenuOpen(not menuOpen) end
+        end
+    end
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        activeSlider = nil
+    end
+end)
+
+lockButton.Activated:Connect(function()
+    positionLocked = not positionLocked
+    updateLockUI()
+end)
+closeButton.Activated:Connect(function() setMenuOpen(false) end)
+enableButton.Activated:Connect(function()
+    enabled = not enabled
+    updateEnabledUI()
+end)
+
+local function getNearestOtherPlayer()
+    local myCharacter = player.Character
+    local myRoot = myCharacter and myCharacter:FindFirstChild("HumanoidRootPart")
+    if not myRoot then return nil end
+    local nearest, nearestDistance = nil, math.huge
+    for _, other in ipairs(Players:GetPlayers()) do
+        if other ~= player and other.Character then
+            local otherRoot = other.Character:FindFirstChild("HumanoidRootPart")
+            local otherHumanoid = other.Character:FindFirstChildOfClass("Humanoid")
+            if otherRoot and otherHumanoid and otherHumanoid.Health > 0 then
+                local distance = (otherRoot.Position - myRoot.Position).Magnitude
+                if distance < nearestDistance then
+                    nearest, nearestDistance = other, distance
+                end
+            end
+        end
+    end
+    return nearest
+end
+
+requestButton.Activated:Connect(function()
+    if not enabled then
+        status.Text = "Hãy bật chức năng trước."
+        return
+    end
+    if requestBusy then return end
+    local target = getNearestOtherPlayer()
+    if not target then
+        status.Text = "Không tìm thấy mục tiêu hợp lệ."
+        return
+    end
+    requestBusy = true
+    status.Text = "Đang gửi yêu cầu tới máy chủ..."
+    remote:FireServer(target, teleportRange, teleportCooldown)
+    task.delay(0.2, function()
+        requestBusy = false
+        if status and status.Parent then
+            status.Text = "Đã gửi yêu cầu; máy chủ sẽ kiểm tra điều kiện."
+        end
+    end)
+end)
+
+-- Khởi chạy ở trạng thái menu thu gọn; các giá trị ban đầu được hiển thị đồng bộ.
+updateEnabledUI()
+updateLockUI()
+setMenuOpen(false)
+clampClusterPosition(cluster.Position.X.Offset, cluster.Position.Y.Offset)
+
+====================================================================
+PHẦN 2 — Script (ServerScriptService)
+====================================================================
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local REMOTE_NAME = "AuthorizedBackstepRequest"
+local MAX_RANGE = 12
+local MIN_RANGE = 1
+local MIN_COOLDOWN = 0.25
+local MAX_COOLDOWN = 3
+local MAX_TARGET_DISTANCE = 100 -- giới hạn khoảng cách giữa người yêu cầu và mục tiêu
+local lastRequestAt = {}
+
+local remote = ReplicatedStorage:FindFirstChild(REMOTE_NAME)
+if not remote then
+    remote = Instance.new("RemoteEvent")
+    remote.Name = REMOTE_NAME
+    remote.Parent = ReplicatedStorage
+end
+
+local function getLivingCharacter(plr)
+    local character = plr and plr.Character
+    if not character then return nil end
+    local root = character:FindFirstChild("HumanoidRootPart")
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if not root or not humanoid or humanoid.Health <= 0 then return nil end
+    return character, root, humanoid
+end
+
+remote.OnServerEvent:Connect(function(plr, target, requestedRange, requestedCooldown)
+    -- Chỉ chấp nhận người chơi thật trong cùng server, không chấp nhận chính mình.
+    if typeof(target) ~= "Instance" or not target:IsA("Player") then return end
+    if target == plr or target.Parent ~= Players then return end
+
+    local now = os.clock()
+    local cooldown = math.clamp(tonumber(requestedCooldown) or 0.5, MIN_COOLDOWN, MAX_COOLDOWN)
+    if now - (lastRequestAt[plr] or -math.huge) < cooldown then return end
+
+    local _, myRoot = getLivingCharacter(plr)
+    local _, targetRoot = getLivingCharacter(target)
+    if not myRoot or not targetRoot then return end
+    if (targetRoot.Position - myRoot.Position).Magnitude > MAX_TARGET_DISTANCE then return end
+
+    local distanceBehind = math.clamp(tonumber(requestedRange) or 4, MIN_RANGE, MAX_RANGE)
+    local look = targetRoot.CFrame.LookVector
+    local flat = Vector3.new(look.X, 0, look.Z)
+    if flat.Magnitude < 0.3 then
+        flat = Vector3.new(targetRoot.Position.X - myRoot.Position.X, 0,
+            targetRoot.Position.Z - myRoot.Position.Z)
+    end
+    if flat.Magnitude < 0.01 then flat = Vector3.new(0, 0, -1) end
+    flat = flat.Unit
+
+    local destination = targetRoot.Position - flat * distanceBehind
+    lastRequestAt[plr] = now
+    myRoot.CFrame = CFrame.lookAt(destination, destination + flat)
+    myRoot.AssemblyLinearVelocity = Vector3.zero
+end)
+
+Players.PlayerRemoving:Connect(function(plr)
+    lastRequestAt[plr] = nil
+end)
+
+====================================================================
+KIỂM THỬ VÀ GIỚI HẠN
+====================================================================
+
+Đã kiểm tra ở mức đọc và tổ chức mã nguồn: hai phần được tách theo đúng nơi đặt trong Roblox Studio; Range và Cooldown cập nhật biến phía client, được gửi trong yêu cầu, rồi được giới hạn lại ở máy chủ; menu mặc định đóng; nút X chỉ đóng menu; nút khóa chỉ chặn kéo cụm nút; việc đóng/mở menu không đổi trạng thái ON/OFF.
+
+Chưa chạy được trong một Roblox Studio experience thực tế tại đây. Vì vậy, chưa thể tuyên bố đã kiểm thử bằng thao tác cảm ứng thực tế, kích thước màn hình cụ thể, đồng bộ mạng hoặc tương tác với game đã xuất bản. Hãy thử trong một place thử nghiệm do bạn sở hữu với ít nhất hai người chơi.
+
+Lưu ý kỹ thuật:
+- Dán PHẦN 1 vào một LocalScript trong StarterPlayer > StarterPlayerScripts.
+- Dán PHẦN 2 vào một Script trong ServerScriptService.
+- Phần máy chủ phải được cài trong chính experience của bạn; một LocalScript chạy bên ngoài không thể tự cài logic máy chủ vào game bên thứ ba.
+- Cơ chế này chỉ là ví dụ hợp lệ cho game của bạn, không tích hợp các hook M1, hoạt ảnh, tự động theo dõi máu hoặc logic của file Delta ban đầu.
