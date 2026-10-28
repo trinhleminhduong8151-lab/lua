@@ -5,8 +5,8 @@ local lp = Players.LocalPlayer
 
 -- ===== CÀI ĐẶT =====
 local BEHIND_DISTANCE = 4   -- đứng sau lưng đối thủ bao nhiêu stud
-local HIT_RANGE = 30        -- đối thủ trong phạm vi này mà mất máu thì tính là mình đánh
-local COOLDOWN = 0.01       -- chống dịch chuyển liên tục (giây)
+local HIT_RANGE = 15        -- đối thủ trong phạm vi này mà mất máu thì tính là mình đánh
+local COOLDOWN = 0.15       -- chống dịch chuyển liên tục (giây)
 
 -- Nhận diện đòn đánh (M1 1-4 và chiêu) qua hoạt ảnh của nhân vật mình
 local DETECT_ANIM_ATTACKS = true
