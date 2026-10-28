@@ -1,480 +1,451 @@
-BACKSTEP MENU + RANGE/COOLDOWN (ROBLOX STUDIO — GAME DO BẠN SỞ HỮU)
-====================================================================
-
-LƯU Ý
-- Đây là bản thay thế dành cho Roblox Studio trong experience do bạn sở hữu/được phép chỉnh sửa.
-- Không phải bản nâng cấp chạy bằng Delta X trong Jujutsu Shenanigans.
-- Có 2 phần code: (1) LocalScript đặt trong StarterPlayer > StarterPlayerScripts; (2) Script đặt trong ServerScriptService.
-- Cả hai phần cần được cài trong cùng một experience. Script máy chủ tự tạo RemoteEvent cần thiết.
-- Cơ chế được kích hoạt bằng nút “DỊCH CHUYỂN THỬ” trong menu; không có hook M1/hoạt ảnh của game bên thứ ba.
-
-====================================================================
-PHẦN 1 — LocalScript (StarterPlayer > StarterPlayerScripts)
-====================================================================
-
 local Players = game:GetService("Players")
-local UserInputService = game:GetService("UserInputService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local player = Players.LocalPlayer
-local playerGui = player:WaitForChild("PlayerGui")
-local remote = ReplicatedStorage:WaitForChild("AuthorizedBackstepRequest")
+local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local lp = Players.LocalPlayer
 
--- Cấu hình mặc định trong phiên chạy hiện tại.
-local teleportRange = 4          -- khoảng cách đứng sau mục tiêu, đơn vị stud
-local teleportCooldown = 0.5    -- giây
-local enabled = false
-local positionLocked = false
+-- ===== CÀI ĐẶT =====
+local BEHIND_DISTANCE = 4
+local HIT_RANGE = 30
+local COOLDOWN = 0.01
+local DETECT_ANIM_ATTACKS = true
+local DEBUG = false
+local ATTACK_ANIM_IDS = {}
+local SWING_DEDUPE = 0.15
+local HIT_DEDUPE = 0.3
+local FACE_HOLD_TIME = 0.25
+local MIN_FACE_DISTANCE = 0.5
+
+local SKILL_KEYS = {
+	[Enum.KeyCode.One] = true,
+	[Enum.KeyCode.Two] = true,
+	[Enum.KeyCode.Three] = true,
+	[Enum.KeyCode.Four] = true,
+	[Enum.KeyCode.Z] = true,
+	[Enum.KeyCode.X] = true,
+	[Enum.KeyCode.C] = true,
+	[Enum.KeyCode.V] = true,
+	[Enum.KeyCode.R] = true,
+	[Enum.KeyCode.T] = true,
+	[Enum.KeyCode.G] = true,
+}
+
+-- ===== BIẾN MỚI =====
+local floatLocked = true
+local floatPos = UDim2.new(0.06, 0, 0.62, 0)
 local menuOpen = false
-local requestBusy = false
+local rangeMin, rangeMax, rangeStep = 1, 12, 0.25
+local cdMin, cdMax, cdStep = 0.01, 0.6, 0.01
 
--- Chống tạo GUI trùng khi LocalScript bị khởi tạo lại.
-local oldGui = playerGui:FindFirstChild("AuthorizedBackstepUI")
-if oldGui then oldGui:Destroy() end
+-- ===== TRẠNG THÁI CHUNG =====
+local enabled = false
+local lastTrigger = 0
+local selected = nil
 
-local function create(className, props, parent)
-    local obj = Instance.new(className)
-    for key, value in pairs(props or {}) do
-        obj[key] = value
-    end
-    obj.Parent = parent
-    return obj
+local function dbg(...)
+	if DEBUG then print("[Backstep]", ...) end
 end
 
-local function addCorner(obj, radius)
-    create("UICorner", {CornerRadius = UDim.new(0, radius or 10)}, obj)
+-- ===== LOGIC CŨ - KHÔNG THAY ĐỔI =====
+local function getRoot()
+	local c = lp.Character
+	return c and c:FindFirstChild("HumanoidRootPart")
 end
 
-local gui = create("ScreenGui", {
-    Name = "AuthorizedBackstepUI",
-    ResetOnSpawn = false,
-    IgnoreGuiInset = true,
-    DisplayOrder = 999,
-    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-}, playerGui)
-
--- Cụm nút nổi: nút tròn + ổ khóa nằm cạnh nhau.
-local cluster = create("Frame", {
-    Name = "FloatingCluster",
-    Size = UDim2.fromOffset(104, 48),
-    Position = UDim2.fromOffset(18, 250),
-    BackgroundTransparency = 1,
-    ZIndex = 20,
-}, gui)
-
-local orb = create("TextButton", {
-    Name = "OpenMenuButton",
-    Size = UDim2.fromOffset(48, 48),
-    Position = UDim2.fromOffset(0, 0),
-    BackgroundColor3 = Color3.fromRGB(35, 105, 185),
-    Text = "B",
-    TextColor3 = Color3.new(1, 1, 1),
-    TextSize = 20,
-    Font = Enum.Font.GothamBold,
-    AutoButtonColor = true,
-    ZIndex = 21,
-}, cluster)
-addCorner(orb, 24)
-
-local lockButton = create("TextButton", {
-    Name = "PositionLockButton",
-    Size = UDim2.fromOffset(48, 48),
-    Position = UDim2.fromOffset(56, 0),
-    BackgroundColor3 = Color3.fromRGB(55, 55, 55),
-    Text = "🔓",
-    TextColor3 = Color3.new(1, 1, 1),
-    TextSize = 21,
-    Font = Enum.Font.GothamBold,
-    AutoButtonColor = true,
-    ZIndex = 21,
-}, cluster)
-addCorner(lockButton, 24)
-
--- Menu chính.
-local menu = create("Frame", {
-    Name = "MainMenu",
-    Size = UDim2.fromOffset(270, 300),
-    Position = UDim2.new(0.5, -135, 0.5, -150),
-    BackgroundColor3 = Color3.fromRGB(28, 28, 32),
-    BorderSizePixel = 0,
-    Visible = false,
-    ZIndex = 5,
-}, gui)
-addCorner(menu, 12)
-create("UIStroke", {Color = Color3.fromRGB(75, 75, 85), Thickness = 1}, menu)
-
-local top = create("Frame", {
-    Size = UDim2.new(1, 0, 0, 42),
-    BackgroundColor3 = Color3.fromRGB(38, 38, 45),
-    BorderSizePixel = 0,
-    ZIndex = 6,
-}, menu)
-addCorner(top, 12)
-
-create("TextLabel", {
-    Size = UDim2.new(1, -52, 1, 0),
-    Position = UDim2.fromOffset(12, 0),
-    BackgroundTransparency = 1,
-    Text = "BACKSTEP SETTINGS",
-    TextColor3 = Color3.new(1, 1, 1),
-    Font = Enum.Font.GothamBold,
-    TextSize = 14,
-    TextXAlignment = Enum.TextXAlignment.Left,
-    ZIndex = 7,
-}, top)
-
-local closeButton = create("TextButton", {
-    Name = "CloseButton",
-    Size = UDim2.fromOffset(36, 34),
-    Position = UDim2.new(1, -40, 0, 4),
-    BackgroundColor3 = Color3.fromRGB(150, 50, 50),
-    Text = "X",
-    TextColor3 = Color3.new(1, 1, 1),
-    Font = Enum.Font.GothamBold,
-    TextSize = 17,
-    ZIndex = 8,
-}, top)
-addCorner(closeButton, 8)
-
-local enableButton = create("TextButton", {
-    Name = "EnableToggle",
-    Size = UDim2.new(1, -24, 0, 38),
-    Position = UDim2.fromOffset(12, 54),
-    BackgroundColor3 = Color3.fromRGB(65, 65, 70),
-    Text = "CHỨC NĂNG: TẮT",
-    TextColor3 = Color3.new(1, 1, 1),
-    Font = Enum.Font.GothamBold,
-    TextSize = 13,
-    ZIndex = 6,
-}, menu)
-addCorner(enableButton, 8)
-
-local activeSlider = nil
-
-local function makeSlider(parent, y, titleText, minValue, maxValue, stepValue, initialValue, unit, callback)
-    local title = create("TextLabel", {
-        Size = UDim2.new(1, -24, 0, 20),
-        Position = UDim2.fromOffset(12, y),
-        BackgroundTransparency = 1,
-        Text = titleText,
-        TextColor3 = Color3.fromRGB(235, 235, 235),
-        Font = Enum.Font.Gotham,
-        TextSize = 13,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        ZIndex = 6,
-    }, parent)
-    local valueLabel = create("TextLabel", {
-        Size = UDim2.fromOffset(80, 20),
-        Position = UDim2.new(1, -92, 0, y),
-        BackgroundTransparency = 1,
-        TextColor3 = Color3.fromRGB(130, 205, 255),
-        Font = Enum.Font.GothamBold,
-        TextSize = 13,
-        TextXAlignment = Enum.TextXAlignment.Right,
-        ZIndex = 6,
-    }, parent)
-    local track = create("TextButton", {
-        Name = string.gsub(titleText, "%W", "") .. "Track",
-        Size = UDim2.new(1, -28, 0, 10),
-        Position = UDim2.fromOffset(14, y + 27),
-        BackgroundColor3 = Color3.fromRGB(75, 75, 82),
-        Text = "",
-        AutoButtonColor = false,
-        ZIndex = 6,
-    }, parent)
-    addCorner(track, 5)
-    local fill = create("Frame", {
-        Size = UDim2.new(0, 0, 1, 0),
-        BackgroundColor3 = Color3.fromRGB(45, 145, 225),
-        BorderSizePixel = 0,
-        ZIndex = 7,
-    }, track)
-    addCorner(fill, 5)
-    local knob = create("Frame", {
-        Size = UDim2.fromOffset(16, 16),
-        Position = UDim2.new(0, -8, 0.5, -8),
-        BackgroundColor3 = Color3.new(1, 1, 1),
-        BorderSizePixel = 0,
-        ZIndex = 8,
-    }, track)
-    addCorner(knob, 8)
-
-    local slider = {track = track, value = initialValue, min = minValue, max = maxValue,
-        step = stepValue, fill = fill, knob = knob, label = valueLabel,
-        unit = unit, callback = callback}
-
-    local function setValue(value)
-        value = math.clamp(value, slider.min, slider.max)
-        local steps = math.floor(((value - slider.min) / slider.step) + 0.5)
-        value = math.clamp(slider.min + steps * slider.step, slider.min, slider.max)
-        slider.value = value
-        local fraction = (value - slider.min) / (slider.max - slider.min)
-        slider.fill.Size = UDim2.new(fraction, 0, 1, 0)
-        slider.knob.Position = UDim2.new(fraction, -8, 0.5, -8)
-        local formatted = (slider.step < 1) and string.format("%.2f", value) or string.format("%.0f", value)
-        slider.label.Text = formatted .. slider.unit
-        slider.callback(value)
-    end
-
-    local function setFromX(screenX)
-        local width = math.max(1, track.AbsoluteSize.X)
-        local fraction = math.clamp((screenX - track.AbsolutePosition.X) / width, 0, 1)
-        setValue(slider.min + fraction * (slider.max - slider.min))
-    end
-    slider.setFromX = setFromX
-    slider.setValue = setValue
-    track.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            activeSlider = slider
-            setFromX(input.Position.X)
-        end
-    end)
-    setValue(initialValue)
-    return slider
+local function nearestEnemy(myPos)
+	local best, bestDist
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= lp and p.Character then
+			local r = p.Character:FindFirstChild("HumanoidRootPart")
+			local h = p.Character:FindFirstChildOfClass("Humanoid")
+			if r and h and h.Health > 0 then
+				local d = (r.Position - myPos).Magnitude
+				if not bestDist or d < bestDist then
+					best, bestDist = r, d
+				end
+			end
+		end
+	end
+	return best
 end
 
--- Các slider cập nhật trực tiếp biến cấu hình được dùng khi gửi yêu cầu.
-local rangeSlider = makeSlider(menu, 108, "Teleport Range (stud)", 1, 12, 0.5, teleportRange, "", function(value)
-    teleportRange = value
-end)
-local cooldownSlider = makeSlider(menu, 166, "Teleport Cooldown", 0.25, 3, 0.25, teleportCooldown, " s", function(value)
-    teleportCooldown = value
-end)
-
-local requestButton = create("TextButton", {
-    Name = "RequestTeleport",
-    Size = UDim2.new(1, -24, 0, 38),
-    Position = UDim2.fromOffset(12, 224),
-    BackgroundColor3 = Color3.fromRGB(35, 115, 175),
-    Text = "DỊCH CHUYỂN THỬ",
-    TextColor3 = Color3.new(1, 1, 1),
-    Font = Enum.Font.GothamBold,
-    TextSize = 13,
-    ZIndex = 6,
-}, menu)
-addCorner(requestButton, 8)
-
-local status = create("TextLabel", {
-    Name = "Status",
-    Size = UDim2.new(1, -24, 0, 25),
-    Position = UDim2.fromOffset(12, 266),
-    BackgroundTransparency = 1,
-    Text = "Sẵn sàng — chọn mục tiêu gần nhất.",
-    TextColor3 = Color3.fromRGB(190, 190, 195),
-    Font = Enum.Font.Gotham,
-    TextSize = 10,
-    TextWrapped = true,
-    TextXAlignment = Enum.TextXAlignment.Left,
-    ZIndex = 6,
-}, menu)
-
-local function updateEnabledUI()
-    enableButton.Text = enabled and "CHỨC NĂNG: BẬT" or "CHỨC NĂNG: TẮT"
-    enableButton.BackgroundColor3 = enabled and Color3.fromRGB(0, 135, 75) or Color3.fromRGB(65, 65, 70)
+local function getTargetRoot(myPos, preferred)
+	if selected then
+		local c = selected.Character
+		local r = c and c:FindFirstChild("HumanoidRootPart")
+		local h = c and c:FindFirstChildOfClass("Humanoid")
+		if r and h and h.Health > 0 then return r end
+		return nil
+	end
+	if preferred and preferred.Parent then return preferred end
+	return nearestEnemy(myPos)
 end
 
-local function updateLockUI()
-    lockButton.Text = positionLocked and "🔒" or "🔓"
-    lockButton.BackgroundColor3 = positionLocked and Color3.fromRGB(125, 55, 55) or Color3.fromRGB(55, 55, 55)
+local faceToken = 0
+local function holdFacing(enemyRoot)
+	if FACE_HOLD_TIME <= 0 then return end
+	faceToken += 1
+	local token = faceToken
+	local t0 = os.clock()
+	local conn
+	conn = RunService.Heartbeat:Connect(function()
+		local root = getRoot()
+		if token ~= faceToken or not root or not enemyRoot.Parent or os.clock() - t0 > FACE_HOLD_TIME then
+			conn:Disconnect()
+			return
+		end
+		local d = Vector3.new(enemyRoot.Position.X - root.Position.X, 0, enemyRoot.Position.Z - root.Position.Z)
+		if d.Magnitude < MIN_FACE_DISTANCE then return end
+		root.CFrame = CFrame.lookAt(root.Position, root.Position + d.Unit)
+	end)
 end
 
-local function setMenuOpen(open)
-    menuOpen = open
-    menu.Visible = open
-    -- Không thay đổi enabled hoặc thông số khi đóng/mở menu.
+local function teleportBehind(preferred)
+	if not enabled then return false end
+	if os.clock() - lastTrigger < COOLDOWN then return false end
+	local root = getRoot()
+	if not root then return false end
+	local enemy = getTargetRoot(root.Position, preferred)
+	if not enemy then return false end
+	lastTrigger = os.clock()
+	local myPos = root.Position
+	local enemyPos = enemy.Position
+	local look = enemy.CFrame.LookVector
+	local flat = Vector3.new(look.X, 0, look.Z)
+	if flat.Magnitude < 0.3 then
+		flat = Vector3.new(enemyPos.X - myPos.X, 0, enemyPos.Z - myPos.Z)
+		if flat.Magnitude < 0.01 then
+			local mine = root.CFrame.LookVector
+			flat = Vector3.new(mine.X, 0, mine.Z)
+			if flat.Magnitude < 0.01 then flat = Vector3.new(0, 0, -1) end
+		end
+	end
+	flat = flat.Unit
+	local pos = enemyPos - flat * BEHIND_DISTANCE
+	root.CFrame = CFrame.lookAt(pos, pos + flat)
+	root.AssemblyLinearVelocity = Vector3.zero
+	holdFacing(enemy)
+	return true
 end
 
-local function clampClusterPosition(x, y)
-    local camera = workspace.CurrentCamera
-    if not camera then return end
-    local viewport = camera.ViewportSize
-    local maxX = math.max(0, viewport.X - cluster.AbsoluteSize.X)
-    local maxY = math.max(0, viewport.Y - cluster.AbsoluteSize.Y)
-    cluster.Position = UDim2.fromOffset(math.clamp(x, 0, maxX), math.clamp(y, 0, maxY))
+local lastAnyTeleport = 0
+local lastSwingTeleport = 0
+local function onSwing(source)
+	local now = os.clock()
+	if now - lastAnyTeleport < SWING_DEDUPE then return end
+	if teleportBehind() then
+		lastAnyTeleport = now
+		lastSwingTeleport = now
+		dbg("swing ->", source)
+	end
 end
 
--- Kéo bằng nút tròn; thao tác kéo và thao tác nhấn được phân biệt bằng ngưỡng 8 px.
-local floatingDrag = nil
-orb.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        floatingDrag = {
-            inputObject = input,
-            inputType = input.UserInputType,
-            start = input.Position,
-            startX = cluster.Position.X.Offset,
-            startY = cluster.Position.Y.Offset,
-            moved = false,
-            wasLocked = positionLocked,
-        }
-    end
-end)
-
-UserInputService.InputChanged:Connect(function(input)
-    if floatingDrag then
-        local isMove = input.UserInputType == Enum.UserInputType.MouseMovement
-            or input.UserInputType == Enum.UserInputType.Touch
-        if isMove and not floatingDrag.wasLocked then
-            local delta = input.Position - floatingDrag.start
-            if delta.Magnitude > 8 then floatingDrag.moved = true end
-            if floatingDrag.moved then
-                clampClusterPosition(floatingDrag.startX + delta.X, floatingDrag.startY + delta.Y)
-            end
-        end
-    end
-    if activeSlider and (input.UserInputType == Enum.UserInputType.MouseMovement
-        or input.UserInputType == Enum.UserInputType.Touch) then
-        activeSlider.setFromX(input.Position.X)
-    end
-end)
-
-UserInputService.InputEnded:Connect(function(input)
-    if floatingDrag then
-        local sameGesture = (floatingDrag.inputType == Enum.UserInputType.MouseButton1
-            and input.UserInputType == Enum.UserInputType.MouseButton1)
-            or (floatingDrag.inputType == Enum.UserInputType.Touch and input == floatingDrag.inputObject)
-        if sameGesture then
-            local moved = floatingDrag.moved
-            floatingDrag = nil
-            if not moved then setMenuOpen(not menuOpen) end
-        end
-    end
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        activeSlider = nil
-    end
-end)
-
-lockButton.Activated:Connect(function()
-    positionLocked = not positionLocked
-    updateLockUI()
-end)
-closeButton.Activated:Connect(function() setMenuOpen(false) end)
-enableButton.Activated:Connect(function()
-    enabled = not enabled
-    updateEnabledUI()
-end)
-
-local function getNearestOtherPlayer()
-    local myCharacter = player.Character
-    local myRoot = myCharacter and myCharacter:FindFirstChild("HumanoidRootPart")
-    if not myRoot then return nil end
-    local nearest, nearestDistance = nil, math.huge
-    for _, other in ipairs(Players:GetPlayers()) do
-        if other ~= player and other.Character then
-            local otherRoot = other.Character:FindFirstChild("HumanoidRootPart")
-            local otherHumanoid = other.Character:FindFirstChildOfClass("Humanoid")
-            if otherRoot and otherHumanoid and otherHumanoid.Health > 0 then
-                local distance = (otherRoot.Position - myRoot.Position).Magnitude
-                if distance < nearestDistance then
-                    nearest, nearestDistance = other, distance
-                end
-            end
-        end
-    end
-    return nearest
+local function onHit(source, preferred)
+	local now = os.clock()
+	if now - lastSwingTeleport < HIT_DEDUPE then return end
+	if teleportBehind(preferred) then
+		lastAnyTeleport = now
+		dbg("hit ->", source)
+	end
 end
 
-requestButton.Activated:Connect(function()
-    if not enabled then
-        status.Text = "Hãy bật chức năng trước."
-        return
-    end
-    if requestBusy then return end
-    local target = getNearestOtherPlayer()
-    if not target then
-        status.Text = "Không tìm thấy mục tiêu hợp lệ."
-        return
-    end
-    requestBusy = true
-    status.Text = "Đang gửi yêu cầu tới máy chủ..."
-    remote:FireServer(target, teleportRange, teleportCooldown)
-    task.delay(0.2, function()
-        requestBusy = false
-        if status and status.Parent then
-            status.Text = "Đã gửi yêu cầu; máy chủ sẽ kiểm tra điều kiện."
-        end
-    end)
-end)
+local myConn
+local function hookSelf(char)
+	if myConn then myConn:Disconnect() end
+	local hum = char:WaitForChild("Humanoid")
+	local last = hum.Health
+	myConn = hum.HealthChanged:Connect(function(h)
+		if h < last then onHit("self") end
+		last = h
+	end)
+end
+if lp.Character then task.spawn(hookSelf, lp.Character) end
+lp.CharacterAdded:Connect(hookSelf)
 
--- Khởi chạy ở trạng thái menu thu gọn; các giá trị ban đầu được hiển thị đồng bộ.
-updateEnabledUI()
-updateLockUI()
-setMenuOpen(false)
-clampClusterPosition(cluster.Position.X.Offset, cluster.Position.Y.Offset)
-
-====================================================================
-PHẦN 2 — Script (ServerScriptService)
-====================================================================
-
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-
-local REMOTE_NAME = "AuthorizedBackstepRequest"
-local MAX_RANGE = 12
-local MIN_RANGE = 1
-local MIN_COOLDOWN = 0.25
-local MAX_COOLDOWN = 3
-local MAX_TARGET_DISTANCE = 100 -- giới hạn khoảng cách giữa người yêu cầu và mục tiêu
-local lastRequestAt = {}
-
-local remote = ReplicatedStorage:FindFirstChild(REMOTE_NAME)
-if not remote then
-    remote = Instance.new("RemoteEvent")
-    remote.Name = REMOTE_NAME
-    remote.Parent = ReplicatedStorage
+local function hookEnemy(p, char)
+	local hum = char:WaitForChild("Humanoid", 10)
+	local root = char:WaitForChild("HumanoidRootPart", 10)
+	if not hum or not root then return end
+	local last = hum.Health
+	hum.HealthChanged:Connect(function(h)
+		if h < last and h > 0 then
+			if selected == nil or selected == p then
+				local myRoot = getRoot()
+				if myRoot and (root.Position - myRoot.Position).Magnitude <= HIT_RANGE then
+					onHit("enemy:" .. p.Name, selected == nil and root or nil)
+				end
+			end
+		end
+		last = h
+	end)
 end
 
-local function getLivingCharacter(plr)
-    local character = plr and plr.Character
-    if not character then return nil end
-    local root = character:FindFirstChild("HumanoidRootPart")
-    local humanoid = character:FindFirstChildOfClass("Humanoid")
-    if not root or not humanoid or humanoid.Health <= 0 then return nil end
-    return character, root, humanoid
+local function hookPlayer(p)
+	if p == lp then return end
+	if p.Character then task.spawn(hookEnemy, p, p.Character) end
+	p.CharacterAdded:Connect(function(c) hookEnemy(p, c) end)
+end
+for _, p in ipairs(Players:GetPlayers()) do hookPlayer(p) end
+Players.PlayerAdded:Connect(hookPlayer)
+
+UIS.InputBegan:Connect(function(input)
+	if UIS:GetFocusedTextBox() then return end
+	if input.UserInputType == Enum.UserInputType.Keyboard and SKILL_KEYS[input.KeyCode] then
+		onSwing("key:" .. input.KeyCode.Name)
+	end
+end)
+
+local hookedTools = {}
+local function hookTool(tool)
+	if not tool:IsA("Tool") or hookedTools[tool] then return end
+	hookedTools[tool] = true
+	tool.Activated:Connect(function() onSwing("tool:" .. tool.Name) end)
 end
 
-remote.OnServerEvent:Connect(function(plr, target, requestedRange, requestedCooldown)
-    -- Chỉ chấp nhận người chơi thật trong cùng server, không chấp nhận chính mình.
-    if typeof(target) ~= "Instance" or not target:IsA("Player") then return end
-    if target == plr or target.Parent ~= Players then return end
+local function hookToolContainer(container)
+	for _, t in ipairs(container:GetChildren()) do hookTool(t) end
+	container.ChildAdded:Connect(hookTool)
+end
 
-    local now = os.clock()
-    local cooldown = math.clamp(tonumber(requestedCooldown) or 0.5, MIN_COOLDOWN, MAX_COOLDOWN)
-    if now - (lastRequestAt[plr] or -math.huge) < cooldown then return end
-
-    local _, myRoot = getLivingCharacter(plr)
-    local _, targetRoot = getLivingCharacter(target)
-    if not myRoot or not targetRoot then return end
-    if (targetRoot.Position - myRoot.Position).Magnitude > MAX_TARGET_DISTANCE then return end
-
-    local distanceBehind = math.clamp(tonumber(requestedRange) or 4, MIN_RANGE, MAX_RANGE)
-    local look = targetRoot.CFrame.LookVector
-    local flat = Vector3.new(look.X, 0, look.Z)
-    if flat.Magnitude < 0.3 then
-        flat = Vector3.new(targetRoot.Position.X - myRoot.Position.X, 0,
-            targetRoot.Position.Z - myRoot.Position.Z)
-    end
-    if flat.Magnitude < 0.01 then flat = Vector3.new(0, 0, -1) end
-    flat = flat.Unit
-
-    local destination = targetRoot.Position - flat * distanceBehind
-    lastRequestAt[plr] = now
-    myRoot.CFrame = CFrame.lookAt(destination, destination + flat)
-    myRoot.AssemblyLinearVelocity = Vector3.zero
+local function hookCharacterTools(char) hookToolContainer(char) end
+if lp.Character then hookCharacterTools(lp.Character) end
+lp.CharacterAdded:Connect(hookCharacterTools)
+task.spawn(function()
+	hookToolContainer(lp:WaitForChild("Backpack"))
+	lp.CharacterAdded:Connect(function()
+		hookToolContainer(lp:WaitForChild("Backpack"))
+	end)
 end)
 
-Players.PlayerRemoving:Connect(function(plr)
-    lastRequestAt[plr] = nil
+local IGNORED_PRIORITY = {
+	[Enum.AnimationPriority.Core] = true,
+	[Enum.AnimationPriority.Idle] = true,
+	[Enum.AnimationPriority.Movement] = true,
+}
+
+local function isAttackTrack(tr)
+	if tr.Looped then return false end
+	if IGNORED_PRIORITY[tr.Priority] then return false end
+	if next(ATTACK_ANIM_IDS) ~= nil then
+		local id = tr.Animation and tr.Animation.AnimationId
+		return id ~= nil and ATTACK_ANIM_IDS[id] == true
+	end
+	return true
+end
+
+local activeTracks = {}
+RunService.Heartbeat:Connect(function()
+	if not DETECT_ANIM_ATTACKS then return end
+	local char = lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local animator = hum and hum:FindFirstChildOfClass("Animator")
+	if not animator then
+		activeTracks = {}
+		return
+	end
+	local nowPlaying = {}
+	for _, tr in ipairs(animator:GetPlayingAnimationTracks()) do
+		local t = tr.TimePosition
+		local prev = activeTracks[tr]
+		nowPlaying[tr] = t
+		if prev == nil or t + 0.001 < prev then
+			dbg("anim", tr.Name, tr.Animation and tr.Animation.AnimationId, tr.Priority.Name, "looped=" .. tostring(tr.Looped))
+			if isAttackTrack(tr) then
+				onSwing("anim:" .. tr.Name)
+			end
+		end
+	end
+	activeTracks = nowPlaying
 end)
 
-====================================================================
-KIỂM THỬ VÀ GIỚI HẠN
-====================================================================
+-- ===== GIAO DIỆN =====
+local gui = Instance.new("ScreenGui")
+gui.Name = "BackstepGui"
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 999
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+pcall(function() gui.Parent = (gethui and gethui()) or game:GetService("CoreGui") end)
+if not gui.Parent then gui.Parent = lp:WaitForChild("PlayerGui") end
 
-Đã kiểm tra ở mức đọc và tổ chức mã nguồn: hai phần được tách theo đúng nơi đặt trong Roblox Studio; Range và Cooldown cập nhật biến phía client, được gửi trong yêu cầu, rồi được giới hạn lại ở máy chủ; menu mặc định đóng; nút X chỉ đóng menu; nút khóa chỉ chặn kéo cụm nút; việc đóng/mở menu không đổi trạng thái ON/OFF.
+-- === NÚT NỔI ===
+local floatFrame = Instance.new("Frame")
+floatFrame.Name = "FloatHolder"
+floatFrame.Size = UDim2.fromOffset(86, 42)
+floatFrame.Position = floatPos
+floatFrame.BackgroundTransparency = 1
+floatFrame.Parent = gui
 
-Chưa chạy được trong một Roblox Studio experience thực tế tại đây. Vì vậy, chưa thể tuyên bố đã kiểm thử bằng thao tác cảm ứng thực tế, kích thước màn hình cụ thể, đồng bộ mạng hoặc tương tác với game đã xuất bản. Hãy thử trong một place thử nghiệm do bạn sở hữu với ít nhất hai người chơi.
+local btnCircle = Instance.new("TextButton")
+btnCircle.Name = "FloatCircleBtn"
+btnCircle.Size = UDim2.fromOffset(40, 40)
+btnCircle.Position = UDim2.fromOffset(0, 1)
+btnCircle.BackgroundColor3 = Color3.fromRGB(20, 160, 220)
+btnCircle.Text = ""
+btnCircle.AutoButtonColor = false
+Instance.new("UICorner", btnCircle).CornerRadius = UDim.new(0, 20)
+btnCircle.Parent = floatFrame
 
-Lưu ý kỹ thuật:
-- Dán PHẦN 1 vào một LocalScript trong StarterPlayer > StarterPlayerScripts.
-- Dán PHẦN 2 vào một Script trong ServerScriptService.
-- Phần máy chủ phải được cài trong chính experience của bạn; một LocalScript chạy bên ngoài không thể tự cài logic máy chủ vào game bên thứ ba.
-- Cơ chế này chỉ là ví dụ hợp lệ cho game của bạn, không tích hợp các hook M1, hoạt ảnh, tự động theo dõi máu hoặc logic của file Delta ban đầu.
+local btnLock = Instance.new("TextButton")
+btnLock.Name = "LockBtn"
+btnLock.Size = UDim2.fromOffset(40, 40)
+btnLock.Position = UDim2.fromOffset(46, 1)
+btnLock.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+btnLock.Text = "🔒"
+btnLock.TextColor3 = Color3.new(1, 1, 1)
+btnLock.Font = Enum.Font.GothamBold
+btnLock.TextSize = 18
+btnLock.AutoButtonColor = false
+Instance.new("UICorner", btnLock).CornerRadius = UDim.new(0, 20)
+btnLock.Parent = floatFrame
+
+-- === MENU CHÍNH ===
+local mainMenuFrame = Instance.new("Frame")
+mainMenuFrame.Name = "MainMenu"
+mainMenuFrame.Size = UDim2.fromOffset(220, 440)
+mainMenuFrame.Position = UDim2.new(0.14, 0, 0.30, 0)
+mainMenuFrame.BackgroundColor3 = Color3.fromRGB(22, 22, 22)
+mainMenuFrame.Visible = false
+Instance.new("UICorner", mainMenuFrame).CornerRadius = UDim.new(0, 12)
+mainMenuFrame.Parent = gui
+
+local btnCloseX = Instance.new("TextButton")
+btnCloseX.Name = "CloseX"
+btnCloseX.Size = UDim2.fromOffset(32, 32)
+btnCloseX.Position = UDim2.fromOffset(182, 6)
+btnCloseX.BackgroundColor3 = Color3.fromRGB(60, 30, 30)
+btnCloseX.Text = "✕"
+btnCloseX.TextColor3 = Color3.new(1, 1, 1)
+btnCloseX.Font = Enum.Font.GothamBold
+btnCloseX.TextSize = 18
+btnCloseX.AutoButtonColor = false
+Instance.new("UICorner", btnCloseX).CornerRadius = UDim.new(0, 16)
+btnCloseX.Parent = mainMenuFrame
+
+local contentContainer = Instance.new("Frame")
+contentContainer.Name = "ContentContainer"
+contentContainer.Size = UDim2.fromOffset(210, 400)
+contentContainer.Position = UDim2.fromOffset(5, 38)
+contentContainer.BackgroundTransparency = 1
+contentContainer.Parent = mainMenuFrame
+
+-- === THANH TRƯỢT RANGE ===
+local sliderRangeLabel = Instance.new("TextLabel")
+sliderRangeLabel.Name = "SliderRangeLabel"
+sliderRangeLabel.Size = UDim2.fromOffset(210, 20)
+sliderRangeLabel.Position = UDim2.fromOffset(0, 0)
+sliderRangeLabel.BackgroundTransparency = 1
+sliderRangeLabel.TextColor3 = Color3.new(1, 1, 1)
+sliderRangeLabel.Font = Enum.Font.Gotham
+sliderRangeLabel.TextSize = 12
+sliderRangeLabel.Text = "Teleport Range: " .. string.format("%.2f", BEHIND_DISTANCE)
+sliderRangeLabel.Parent = contentContainer
+
+local sliderRangeBg = Instance.new("Frame")
+sliderRangeBg.Name = "SliderRangeBg"
+sliderRangeBg.Size = UDim2.fromOffset(210, 12)
+sliderRangeBg.Position = UDim2.fromOffset(0, 22)
+sliderRangeBg.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+Instance.new("UICorner", sliderRangeBg).CornerRadius = UDim.new(0, 6)
+sliderRangeBg.Parent = contentContainer
+
+local sliderRangeFill = Instance.new("Frame")
+sliderRangeFill.Name = "Fill"
+sliderRangeFill.Size = UDim2.fromScale((BEHIND_DISTANCE - rangeMin) / (rangeMax - rangeMin), 1)
+sliderRangeFill.BackgroundColor3 = Color3.fromRGB(0, 180, 120)
+Instance.new("UICorner", sliderRangeFill).CornerRadius = UDim.new(0, 6)
+sliderRangeFill.Parent = sliderRangeBg
+
+-- === THANH TRƯỢT COOLDOWN ===
+local sliderCdLabel = Instance.new("TextLabel")
+sliderCdLabel.Name = "SliderCdLabel"
+sliderCdLabel.Size = UDim2.fromOffset(210, 20)
+sliderCdLabel.Position = UDim2.fromOffset(0, 50)
+sliderCdLabel.BackgroundTransparency = 1
+sliderCdLabel.TextColor3 = Color3.new(1, 1, 1)
+sliderCdLabel.Font = Enum.Font.Gotham
+sliderCdLabel.TextSize = 12
+sliderCdLabel.Text = "Teleport Cooldown: " .. string.format("%.2f s", COOLDOWN)
+sliderCdLabel.Parent = contentContainer
+
+local sliderCdBg = Instance.new("Frame")
+sliderCdBg.Name = "SliderCdBg"
+sliderCdBg.Size = UDim2.fromOffset(210, 12)
+sliderCdBg.Position = UDim2.fromOffset(0, 72)
+sliderCdBg.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+Instance.new("UICorner", sliderCdBg).CornerRadius = UDim.new(0, 6)
+sliderCdBg.Parent = contentContainer
+
+local sliderCdFill = Instance.new("Frame")
+sliderCdFill.Name = "Fill"
+sliderCdFill.Size = UDim2.fromScale((COOLDOWN - cdMin) / (cdMax - cdMin), 1)
+sliderCdFill.BackgroundColor3 = Color3.fromRGB(220, 160, 0)
+Instance.new("UICorner", sliderCdFill).CornerRadius = UDim.new(0, 6)
+sliderCdFill.Parent = sliderCdBg
+
+-- === NÚT BẬT/TẮT ===
+local btnToggle = Instance.new("TextButton")
+btnToggle.Name = "ToggleBtn"
+btnToggle.Size = UDim2.fromOffset(210, 36)
+btnToggle.Position = UDim2.fromOffset(0, 100)
+btnToggle.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+btnToggle.TextColor3 = Color3.new(1, 1, 1)
+btnToggle.Font = Enum.Font.GothamBold
+btnToggle.TextSize = 13
+btnToggle.Text = "SAU LƯNG: TẮT"
+btnToggle.AutoButtonColor = false
+Instance.new("UICorner", btnToggle).CornerRadius = UDim.new(0, 8)
+btnToggle.Parent = contentContainer
+
+-- === DANH SÁCH NGƯỜI CHƠI ===
+local list = Instance.new("ScrollingFrame")
+list.Name = "PlayerList"
+list.Size = UDim2.fromOffset(210, 240)
+list.Position = UDim2.fromOffset(0, 145)
+list.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+list.BorderSizePixel = 0
+list.ScrollBarThickness = 4
+list.CanvasSize = UDim2.new(0, 0, 0, 0)
+list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+Instance.new("UICorner", list).CornerRadius = UDim.new(0, 8)
+list.Parent = contentContainer
+
+local layout = Instance.new("UIListLayout", list)
+layout.Padding = UDim.new(0, 4)
+layout.SortOrder = Enum.SortOrder.LayoutOrder
+
+local noneBtn = Instance.new("TextButton")
+noneBtn.Name = "NoTarget"
+noneBtn.LayoutOrder = 0
+noneBtn.Size = UDim2.new(1, 0, 0, 32)
+noneBtn.BackgroundColor3 = Color3.fromRGB(0, 120, 60)
+noneBtn.Text = "Không mục tiêu (tự động)"
+noneBtn.TextColor3 = Color3.new(1, 1, 1)
+noneBtn.Font = Enum.Font.GothamBold
+noneBtn.TextSize = 13
+noneBtn.AutoButtonColor = false
+Instance.new("UICorner", noneBtn).CornerRadius = UDim.new(0, 6)
+noneBtn.Parent = list
+
+local rows = {}
+local function escapeRich(s)
+	return (tostring(s):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
+end
+
+local function addRow(p)
+	if p == lp or rows[p] then return end
+	local row = Instance.new("TextButton")
+	row.Name = string.lower(p.Name)
+	row.LayoutOrder = 100 + #rows
+	row.Size = UDim2.new(1, 0, 0, 30)
+	row.BackgroundColor3 = Color3.fromRGB(55, 55, 55)
+	row.AutoButtonColor = false
+	row.Parent = list
+	Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
+
+	local label = Instance.new("TextLabel")
+	label.BackgroundTransparency = 1
+	label.Position = UDim2.fromOffset(8, 0)
+	label.Size = UDim2.new(1, -16, 1, 0)
+	label.Font = Enum.Font.Gotham
+	label.TextSize = 12
+	label.TextColor3 = Color3.new(1, 1, 1)
+	label.TextXAlignment
