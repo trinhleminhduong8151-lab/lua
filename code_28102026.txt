@@ -1,0 +1,420 @@
+-- ==================================================
+-- BACKSTEP SCRIPT - TỐI ƯU CHO DELTA X
+-- Chức năng: Dịch chuyển ra sau lưng đối thủ khi đánh/bị đánh
+-- ==================================================
+
+-- ===== KHAI BÁO DỊCH VỤ =====
+local Players = game:GetService("Players")        -- Lấy danh sách người chơi
+local UIS = game:GetService("UserInputService")    -- Lấy sự kiện bàn phím/cảm ứng
+local RunService = game:GetService("RunService")  -- Cập nhật liên tục theo khung hình
+local lp = Players.LocalPlayer                     -- Lấy chính người chơi
+
+-- ===== CÀI ĐẶT =====
+local BEHIND_DISTANCE = 4       -- Khoảng cách đứng sau lưng đối thủ (stud)
+local HIT_RANGE = 30            -- Phạm vi phát hiện đánh trúng
+local COOLDOWN = 0.01           -- Thời gian chờ giữa 2 lần dịch chuyển
+local DETECT_ANIM_ATTACKS = true -- Tự phát hiện đòn đánh qua hoạt ảnh
+local DEBUG = false              -- In thông tin ra console (đặt true để xem)
+local ATTACK_ANIM_IDS = {}       -- Để trống = nhận mọi hoạt ảnh đánh
+local SWING_DEDUPE = 0.15        -- Thời gian bỏ qua đòn trùng lặp (giây)
+local HIT_DEDUPE = 0.3           -- Thời gian bỏ qua sự kiện trúng đòn trùng
+local FACE_HOLD_TIME = 0.25      -- Giữ mặt hướng về đối thủ sau dịch
+local MIN_FACE_DISTANCE = 0.5    -- Gần hơn mức này thì không xoay nữa
+
+-- Phím dùng chiêu: nhấn các phím này để dịch chuyển
+local SKILL_KEYS = {
+    [Enum.KeyCode.One] = true,
+    [Enum.KeyCode.Two] = true,
+    [Enum.KeyCode.Three] = true,
+    [Enum.KeyCode.Four] = true,
+    [Enum.KeyCode.Z] = true,
+    [Enum.KeyCode.X] = true,
+    [Enum.KeyCode.C] = true,
+    [Enum.KeyCode.V] = true,
+    [Enum.KeyCode.R] = true,
+    [Enum.KeyCode.T] = true,
+    [Enum.KeyCode.G] = true,
+}
+
+-- ===== BIẾN QUẢN LÝ TRẠNG THÁI =====
+local enabled = false            -- Bật/Tắt toàn bộ tính năng
+local lastTrigger = 0           -- Thời gian lần dịch chuyển gần nhất
+local selected = nil             -- Mục tiêu được chọn (nil = tự động chọn)
+local lastAnyTeleport = 0       -- Thời gian dịch chuyển gần nhất (chống trùng)
+local lastSwingTeleport = 0     -- Thời gian dịch chuyển khi ra đòn
+
+-- ===== BIẾN GIAO DIỆN MỚI =====
+local menuOpen = false           -- Trạng thái mở/đóng menu
+local floatLocked = true        -- Khóa vị trí nút nổi
+local floatPos = UDim2.new(0.06, 0, 0.62, 0) -- Vị trí ban đầu nút nổi
+
+-- ===== HÀM HỖ TRỢ =====
+local function dbg(...)
+    if DEBUG then print("[Backstep]", ...) end
+end
+
+-- ===== LOGIC CỐT LÕI =====
+-- Lấy bộ phận gốc của nhân vật (vị trí trung tâm)
+local function getRoot()
+    local char = lp.Character
+    if char then
+        return char:FindFirstChild("HumanoidRootPart")
+    end
+    return nil
+end
+
+-- Tìm đối thủ gần nhất
+local function nearestEnemy(myPos)
+    local bestEnemy = nil
+    local minDistance = nil
+    
+    -- Duyệt tất cả người chơi trong game
+    for _, player in ipairs(Players:GetPlayers()) do
+        -- Bỏ qua chính mình
+        if player ~= lp and player.Character then
+            local rootPart = player.Character:FindFirstChild("HumanoidRootPart")
+            local humanoid = player.Character:FindFirstChildOfClass("Humanoid")
+            
+            -- Chỉ tính người còn sống
+            if rootPart and humanoid and humanoid.Health > 0 then
+                local distance = (rootPart.Position - myPos).Magnitude
+                -- Cập nhật người gần nhất
+                if not minDistance or distance < minDistance then
+                    bestEnemy = rootPart
+                    minDistance = distance
+                end
+            end
+        end
+    end
+    return bestEnemy
+end
+
+-- Chọn mục tiêu ưu tiên: người bị đánh trúng trước, nếu không có thì gần nhất
+local function getTargetRoot(myPos, preferred)
+    -- Nếu đã khóa mục tiêu thủ công
+    if selected then
+        local char = selected.Character
+        local rootPart = char and char:FindFirstChild("HumanoidRootPart")
+        local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+        if rootPart and humanoid and humanoid.Health > 0 then
+            return rootPart
+        end
+        return nil
+    end
+    -- Ưu tiên người vừa bị đánh trúng
+    if preferred and preferred.Parent then
+        return preferred
+    end
+    -- Không có thì chọn người gần nhất
+    return nearestEnemy(myPos)
+end
+
+-- Giữ nhân vật quay mặt về phía đối thủ sau khi dịch chuyển
+local function holdFacing(enemyRoot)
+    if FACE_HOLD_TIME <= 0 then return end
+    local startTime = os.clock()
+    
+    -- Cập nhật mỗi khung hình trong khoảng thời gian giữ hướng
+    local connection
+    connection = RunService.Heartbeat:Connect(function()
+        local myRoot = getRoot()
+        local now = os.clock()
+        
+        -- Dừng nếu hết thời gian hoặc đối thủ không còn tồn tại
+        if not myRoot or not enemyRoot.Parent or now - startTime > FACE_HOLD_TIME then
+            connection:Disconnect()
+            return
+        end
+        
+        -- Tính hướng từ mình đến đối thủ, bỏ trục Y
+        local direction = Vector3.new(
+            enemyRoot.Position.X - myRoot.Position.X,
+            0,
+            enemyRoot.Position.Z - myRoot.Position.Z
+        )
+        
+        -- Quá gần thì không xoay để tránh rung
+        if direction.Magnitude < MIN_FACE_DISTANCE then return end
+        
+        -- Xoay nhân vật hướng về đối thủ
+        myRoot.CFrame = CFrame.lookAt(myRoot.Position, myRoot.Position + direction.Unit)
+    end)
+end
+
+-- ==== HÀM DỊCH CHUYỂN CHÍNH ====
+local function teleportBehind(preferredTarget)
+    -- Kiểm tra điều kiện cho phép
+    if not enabled then return false end
+    if os.clock() - lastTrigger < COOLDOWN then return false end
+    
+    local myRoot = getRoot()
+    if not myRoot then return false end
+    
+    -- Tìm đối thủ
+    local enemyRoot = getTargetRoot(myRoot.Position, preferredTarget)
+    if not enemyRoot then return false end
+    
+    -- Cập nhật thời gian kích hoạt
+    lastTrigger = os.clock()
+    
+    -- Tính vị trí mới: phía sau lưng đối thủ
+    local enemyPos = enemyRoot.Position
+    local myPos = myRoot.Position
+    local lookDir = enemyRoot.CFrame.LookVector  -- Hướng đối thủ đang nhìn
+    
+    -- Lấy hướng trên mặt phẳng, bỏ trục Y
+    local flatDir = Vector3.new(lookDir.X, 0, lookDir.Z)
+    
+    -- Nếu đối thủ ngã/không xác định hướng, dùng vị trí tương đối hiện tại
+    if flatDir.Magnitude < 0.3 then
+        flatDir = Vector3.new(enemyPos.X - myPos.X, 0, enemyPos.Z - myPos.Z)
+        if flatDir.Magnitude < 0.01 then
+            local myLook = myRoot.CFrame.LookVector
+            flatDir = Vector3.new(myLook.X, 0, myLook.Z)
+            if flatDir.Magnitude < 0.01 then
+                flatDir = Vector3.new(0, 0, -1) -- Mặc định hướng âm Z
+            end
+        end
+    end
+    
+    -- Chuẩn hóa vector độ dài = 1
+    flatDir = flatDir.Unit
+    
+    -- Tính vị trí đứng sau lưng đối thủ
+    local newPosition = enemyPos - flatDir * BEHIND_DISTANCE
+    
+    -- Thực hiện dịch chuyển + xoay mặt về đối thủ
+    myRoot.CFrame = CFrame.lookAt(newPosition, newPosition + flatDir)
+    myRoot.AssemblyLinearVelocity = Vector3.zero  -- Dừng vận tốc để không trượt
+    holdFacing(enemyRoot)
+    
+    return true
+end
+
+-- ==== KÍCH HOẠT DỊCH CHUYỂN ====
+-- Khi ra đòn / dùng chiêu
+local function onSwing(source)
+    local now = os.clock()
+    -- Bỏ qua nếu vừa dịch chuyển gần đây
+    if now - lastAnyTeleport < SWING_DEDUPE then return end
+    
+    if teleportBehind() then
+        lastAnyTeleport = now
+        lastSwingTeleport = now
+        dbg("Ra đòn -> dịch chuyển thành công:", source)
+    end
+end
+
+-- Khi đánh trúng hoặc bị đánh
+local function onHit(source, preferredTarget)
+    local now = os.clock()
+    -- Bỏ qua nếu đòn này đã kích hoạt dịch chuyển lúc ra đòn
+    if now - lastSwingTeleport < HIT_DEDUPE then return end
+    
+    if teleportBehind(preferredTarget) then
+        lastAnyTeleport = now
+        dbg("Trúng đòn -> dịch chuyển thành công:", source)
+    end
+end
+
+-- ==== THEO DÕI MÁU - BỊ ĐÁNH ====
+local healthConnection = nil
+local function hookSelfCharacter(character)
+    -- Ngắt kết nối cũ nếu có
+    if healthConnection then
+        healthConnection:Disconnect()
+    end
+    
+    local humanoid = character:WaitForChild("Humanoid")
+    local lastHealth = humanoid.Health
+    
+    -- Theo dõi thay đổi máu
+    healthConnection = humanoid.HealthChanged:Connect(function(currentHealth)
+        -- Máu giảm = bị đánh
+        if currentHealth < lastHealth then
+            onHit("bị đánh")
+        end
+        lastHealth = currentHealth
+    end)
+end
+
+-- Khởi tạo khi nhân vật xuất hiện
+if lp.Character then
+    hookSelfCharacter(lp.Character)
+end
+lp.CharacterAdded:Connect(hookSelfCharacter)
+
+-- ==== THEO DÕI ĐỐI THỦ - ĐÁNH TRÚNG ====
+local function hookEnemyPlayer(player, character)
+    local humanoid = character:WaitForChild("Humanoid", 10)
+    local rootPart = character:WaitForChild("HumanoidRootPart", 10)
+    if not humanoid or not rootPart then return end
+    
+    local lastHealth = humanoid.Health
+    
+    -- Theo dõi thay đổi máu đối thủ
+    humanoid.HealthChanged:Connect(function(currentHealth)
+        -- Máu giảm > 0 = bị đánh trúng
+        if currentHealth < lastHealth and currentHealth > 0 then
+            -- Chỉ kích hoạt khi không khóa mục tiêu hoặc đúng mục tiêu đã chọn
+            if selected == nil or selected == player then
+                local myRoot = getRoot()
+                -- Kiểm tra trong phạm vi phát hiện
+                if myRoot and (rootPart.Position - myRoot.Position).Magnitude <= HIT_RANGE then
+                    onHit("đánh trúng: " .. player.Name, selected == nil and rootPart or nil)
+                end
+            end
+        end
+        lastHealth = currentHealth
+    end)
+end
+
+-- Áp dụng cho người chơi hiện tại và mới vào
+local function setupPlayerTracking(player)
+    if player == lp then return end
+    if player.Character then
+        hookEnemyPlayer(player, player.Character)
+    end
+    player.CharacterAdded:Connect(function(char)
+        hookEnemyPlayer(player, char)
+    end)
+end
+
+for _, player in ipairs(Players:GetPlayers()) do
+    setupPlayerTracking(player)
+end
+Players.PlayerAdded:Connect(setupPlayerTracking)
+
+-- ==== NHẬN DIỆN PHÍM DÙNG CHIÊU ====
+UIS.InputBegan:Connect(function(input)
+    -- Không kích hoạt khi đang gõ chat/ô nhập liệu
+    if UIS:GetFocusedTextBox() then return end
+    
+    -- Nhấn phím chiêu
+    if input.UserInputType == Enum.UserInputType.Keyboard then
+        if SKILL_KEYS[input.KeyCode] then
+            onSwing("phím: " .. input.KeyCode.Name)
+        end
+    end
+end)
+
+-- ==== NHẬN DIỆN CÔNG CỤ / VŨ KHÍ ====
+local hookedTools = {}
+local function hookTool(tool)
+    if not tool:IsA("Tool") or hookedTools[tool] then return end
+    hookedTools[tool] = true
+    tool.Activated:Connect(function()
+        onSwing("công cụ: " .. tool.Name)
+    end)
+end
+
+local function scanContainerForTools(container)
+    for _, item in ipairs(container:GetChildren()) do
+        hookTool(item)
+    end
+    container.ChildAdded:Connect(hookTool)
+end
+
+-- Theo dõi balô và nhân vật
+scanContainerForTools(lp:WaitForChild("Backpack"))
+lp.CharacterAdded:Connect(function(character)
+    scanContainerForTools(character)
+    scanContainerForTools(lp:WaitForChild("Backpack"))
+end)
+
+-- ==== NHẬN DIỆN HOẠT ẢNH ĐÁNH ====
+local IGNORED_PRIORITY = {
+    [Enum.AnimationPriority.Core] = true,
+    [Enum.AnimationPriority.Idle] = true,
+    [Enum.AnimationPriority.Movement] = true,
+}
+
+local function isAttackAnimation(track)
+    if track.Looped then return false end  -- Bỏ hoạt ảnh lặp (đi bộ, chạy...)
+    if IGNORED_PRIORITY[track.Priority] then return false end
+    if next(ATTACK_ANIM_IDS) ~= nil then
+        local animId = track.Animation and track.Animation.AnimationId
+        return animId ~= nil and ATTACK_ANIM_IDS[animId] == true
+    end
+    return true
+end
+
+local previousTrackStates = {}
+RunService.Heartbeat:Connect(function()
+    if not DETECT_ANIM_ATTACKS then return end
+    
+    local character = lp.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
+    
+    if not animator then
+        previousTrackStates = {}
+        return
+    end
+    
+    local currentlyPlaying = {}
+    -- Kiểm tra từng hoạt ảnh đang phát
+    for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+        local currentTime = track.TimePosition
+        local previousTime = previousTrackStates[track]
+        currentlyPlaying[track] = currentTime
+        
+        -- Hoạt ảnh mới bắt đầu hoặc chạy lại từ đầu
+        if previousTime == nil or currentTime + 0.001 < previousTime then
+            if isAttackAnimation(track) then
+                onSwing("hoạt ảnh: " .. track.Name)
+            end
+        end
+    end
+    previousTrackStates = currentlyPlaying
+end)
+
+-- ===== GIAO DIỆN =====
+-- Tạo cửa sổ chính - Tương thích với mọi executor
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "BackstepGui"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+-- Không dùng gethui(), dùng cách tương thích rộng hơn
+pcall(function() ScreenGui.Parent = game:GetService("CoreGui") end)
+if not ScreenGui.Parent then
+    ScreenGui.Parent = lp:WaitForChild("PlayerGui")
+end
+
+-- === NÚT NỔI TRÒN ===
+local FloatFrame = Instance.new("Frame")
+FloatFrame.Name = "FloatHolder"
+FloatFrame.Size = UDim2.fromOffset(86, 42)
+FloatFrame.Position = floatPos
+FloatFrame.BackgroundTransparency = 1
+FloatFrame.Parent = ScreenGui
+
+local CircleButton = Instance.new("TextButton")
+CircleButton.Name = "CircleBtn"
+CircleButton.Size = UDim2.fromOffset(40, 40)
+CircleButton.Position = UDim2.fromOffset(0, 1)
+CircleButton.BackgroundColor3 = Color3.fromRGB(20, 160, 220)
+CircleButton.Text = ""
+CircleButton.AutoButtonColor = false
+Instance.new("UICorner", CircleButton).CornerRadius = UDim.new(0, 20)
+CircleButton.Parent = FloatFrame
+
+-- === NÚT KHÓA ===
+local LockButton = Instance.new("TextButton")
+LockButton.Name = "LockBtn"
+LockButton.Size = UDim2.fromOffset(40, 40)
+LockButton.Position = UDim2.fromOffset(46, 1)
+LockButton.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+LockButton.Text = "🔒"
+LockButton.TextColor3 = Color3.new(1, 1, 1)
+LockButton.Font = Enum.Font.GothamBold
+LockButton.TextSize = 18
+LockButton.AutoButtonColor = false
+Instance.new("UICorner", LockButton).CornerRadius = UDim.new(0, 20)
+LockButton.Parent = FloatFrame
+
+-- === MENU CHÍNH ===
+local MainMenu = Instance.new("Frame")
+MainMenu.Name = "MainMenu"
+MainMenu.Size = UDim2.fromOffset(220, 140)
+MainMenu.Position
