@@ -1,0 +1,1990 @@
+--[[
+	=============================================================================
+	BACKSTEP PRO HUB [v2.2] - FULL CONTEXT WITH BYPASS TELEPORT & COORDINATE HUD
+	-----------------------------------------------------------------------------
+	- TÍNH NĂNG 1: Dịch chuyển ra sau lưng đối thủ khi đánh thường M1 (1-4), dùng chiêu,
+	               bị đánh trúng hoặc đánh trúng kẻ địch.
+	- TÍNH NĂNG 2: Bypass Teleport đến TỌA ĐỘ CỐ ĐỊNH (1221.7, 209.7, 863.8).
+	               Vòng đời 6 bước: Dịch chuyển -> Kiểm tra duy trì 3s -> 
+	               Khóa toàn bộ chiêu & Ragdoll ngã tự nhiên (JJS Style) -> 
+	               Force Death Reset -> Chờ hồi sinh hoàn toàn -> Thử lại.
+	- TÍNH NĂNG 3: Toạ độ (CoordinateDisplayGUI) hiển thị vị trí X, Y, Z realtime trên màn hình.
+	- BẢO TOÀN NGUYÊN VẸN: Nút tròn nổi di động, ổ khóa đồng bộ 🔒, Slider cự ly & hồi chiêu.
+	=============================================================================
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local ContextActionService = game:GetService("ContextActionService")
+
+local lp = Players.LocalPlayer
+
+-- ===== CẤU HÌNH CỐ ĐỊNH CHỐNG VĂNG (ANTI-SPAM) =====
+local BEHIND_DISTANCE = 4        -- Cự ly mặc định (studs)
+local COOLDOWN = 0.01            -- Thời gian hồi mặc định (giây)
+local FACE_HOLD_TIME = 0.05      -- Thời gian giữ hướng nhìn (giây)
+local MIN_FACE_DISTANCE = 1.0    -- Khoảng cách tối thiểu để xoay mặt (studs)
+local SWING_DEDUPE = 0.02        -- Chống spam khi vung đòn (giây)
+local HIT_DEDUPE = 0.05          -- Chống lặp khi trúng đòn (giây)
+local DETECT_ANIM_ATTACKS = true -- Tự nhận diện M1 (1 đến 4) qua Animation
+local DEBUG = false
+local ATTACK_ANIM_IDS = {}
+local ATTACK_KEYCODES = {
+	[Enum.KeyCode.Q] = true,
+	[Enum.KeyCode.E] = true,
+	[Enum.KeyCode.F] = true,
+	[Enum.KeyCode.Z] = true,
+	[Enum.KeyCode.X] = true,
+	[Enum.KeyCode.C] = true,
+	[Enum.KeyCode.V] = true,
+	[Enum.KeyCode.R] = true,
+	[Enum.KeyCode.T] = true,
+	[Enum.KeyCode.G] = true,
+}
+
+-- ===== CÀI ĐẶT BYPASS TELEPORT (TÍNH NĂNG THỨ 2) =====
+local BYPASS_FIXED_POS = Vector3.new(1221.7, 209.7, 863.8) -- Tọa độ đích cố định bắt buộc
+local BYPASS_HOLD_TIME = 3.0     -- Thời gian duy trì bắt buộc (giây)
+local BYPASS_TOLERANCE = 5.0     -- Phạm vi dung sai vị trí hợp lệ (studs)
+
+local bypassActive = false
+local bypassState = "Idle"       -- "Idle", "Teleporting", "Running", "Ragdolling", "Resetting", "Waiting", "Success", "Cancelled"
+local bypassTimer = 0
+local bypassTargetPos = BYPASS_FIXED_POS
+local bypassToken = 0
+-- =====================================================
+
+local enabled = false
+local lastTrigger = 0
+local selected = nil -- nil = không mục tiêu (tự động)
+local isFloatLocked = false -- Trạng thái khóa vị trí cụm nút nổi
+
+local function dbg(...)
+	if DEBUG then print("[Backstep]", ...) end
+end
+
+-- ===== GIAO DIỆN (GUI) =====
+local gui = Instance.new("ScreenGui")
+gui.Name = "BackstepGui_Upgraded"
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 999
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+pcall(function() gui.Parent = (gethui and gethui()) or game:GetService("CoreGui") end)
+if not gui.Parent then gui.Parent = lp:WaitForChild("PlayerGui") end
+
+-- Hàm tiện ích giới hạn vị trí trong viền màn hình (Screen Clamp)
+local function getClampedPosition(targetPos, sizeOffset)
+	local cam = workspace.CurrentCamera
+	local vp = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+	local maxX = math.max(0, vp.X - sizeOffset.X)
+	local maxY = math.max(0, vp.Y - sizeOffset.Y)
+	local clampedX = math.clamp(targetPos.X, 0, maxX)
+	local clampedY = math.clamp(targetPos.Y, 0, maxY)
+	return UDim2.fromOffset(clampedX, clampedY)
+end
+
+-- =========================================================================
+-- 1. CỤM NÚT TRÒN NỔI & Ổ KHÓA (FLOATING BUTTON CLUSTER)
+-- =========================================================================
+local floatCluster = Instance.new("Frame")
+floatCluster.Name = "FloatCluster"
+floatCluster.Size = UDim2.fromOffset(88, 48)
+floatCluster.Position = UDim2.new(0.05, 0, 0.25, 0)
+floatCluster.BackgroundTransparency = 1
+floatCluster.Parent = gui
+
+-- Nút tròn nổi chính (mở/thu gọn menu chính)
+local floatBtn = Instance.new("TextButton")
+floatBtn.Name = "FloatToggle"
+floatBtn.Size = UDim2.fromOffset(46, 46)
+floatBtn.Position = UDim2.fromOffset(0, 1)
+floatBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+floatBtn.TextColor3 = Color3.fromRGB(0, 230, 120)
+floatBtn.Font = Enum.Font.GothamBold
+floatBtn.TextSize = 20
+floatBtn.Text = "🎯"
+floatBtn.AutoButtonColor = false
+floatBtn.Parent = floatCluster
+Instance.new("UICorner", floatBtn).CornerRadius = UDim.new(1, 0)
+local floatStroke = Instance.new("UIStroke", floatBtn)
+floatStroke.Color = Color3.fromRGB(0, 230, 120)
+floatStroke.Thickness = 2
+floatStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+
+-- Nút ổ khóa đính kèm bên cạnh nút tròn nổi
+local lockBtn = Instance.new("TextButton")
+lockBtn.Name = "LockToggle"
+lockBtn.Size = UDim2.fromOffset(34, 34)
+lockBtn.Position = UDim2.fromOffset(50, 7)
+lockBtn.BackgroundColor3 = Color3.fromRGB(24, 24, 28)
+lockBtn.TextColor3 = Color3.fromRGB(200, 200, 200)
+lockBtn.Font = Enum.Font.GothamBold
+lockBtn.TextSize = 14
+lockBtn.Text = "🔓"
+lockBtn.AutoButtonColor = false
+lockBtn.Parent = floatCluster
+Instance.new("UICorner", lockBtn).CornerRadius = UDim.new(1, 0)
+local lockStroke = Instance.new("UIStroke", lockBtn)
+lockStroke.Color = Color3.fromRGB(70, 70, 80)
+lockStroke.Thickness = 1.5
+
+-- =========================================================================
+-- 2. GIAO DIỆN CHÍNH HÌNH CHỮ NHẬT (RECTANGULAR DASHBOARD)
+-- =========================================================================
+local frame = Instance.new("Frame")
+frame.Name = "Main"
+frame.Size = UDim2.fromOffset(480, 305)
+frame.Position = UDim2.new(0.5, -240, 0.5, -152)
+frame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.ClipsDescendants = true
+frame.Parent = gui
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
+local frameStroke = Instance.new("UIStroke", frame)
+frameStroke.Color = Color3.fromRGB(45, 45, 52)
+frameStroke.Thickness = 1.5
+
+-- Header Bar (Thanh tiêu đề kéo thả)
+local headerBar = Instance.new("Frame")
+headerBar.Name = "HeaderBar"
+headerBar.Size = UDim2.new(1, 0, 0, 34)
+headerBar.Position = UDim2.fromOffset(0, 0)
+headerBar.BackgroundColor3 = Color3.fromRGB(26, 26, 32)
+headerBar.BorderSizePixel = 0
+headerBar.Parent = frame
+
+local titleLabel = Instance.new("TextLabel")
+titleLabel.Name = "Title"
+titleLabel.Size = UDim2.new(1, -70, 1, 0)
+titleLabel.Position = UDim2.fromOffset(12, 0)
+titleLabel.BackgroundTransparency = 1
+titleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+titleLabel.Font = Enum.Font.GothamBold
+titleLabel.TextSize = 13
+titleLabel.RichText = true
+titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+titleLabel.Text = "⚡ BACKSTEP PRO HUB  <font size=\"10\" color=\"#00E678\">[v2.2]</font>"
+titleLabel.Parent = headerBar
+
+-- Nút [X] đóng menu: ẨN MENU NHƯNG VẪN GIỮ LOGIC DỊCH CHUYỂN CHẠY NGẦM
+local closeBtn = Instance.new("TextButton")
+closeBtn.Name = "CloseMenuBtn"
+closeBtn.Size = UDim2.fromOffset(24, 24)
+closeBtn.Position = UDim2.new(1, -28, 0, 5)
+closeBtn.BackgroundColor3 = Color3.fromRGB(38, 38, 46)
+closeBtn.TextColor3 = Color3.fromRGB(255, 110, 110)
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextSize = 13
+closeBtn.Text = "✕"
+closeBtn.AutoButtonColor = false
+closeBtn.Parent = headerBar
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
+
+-- =========================================================================
+-- THANH ĐIỀU HƯỚNG TABS BÊN TRÁI (SIDEBAR)
+-- =========================================================================
+local sidebar = Instance.new("Frame")
+sidebar.Name = "Sidebar"
+sidebar.Size = UDim2.new(0, 126, 1, -44)
+sidebar.Position = UDim2.fromOffset(8, 38)
+sidebar.BackgroundColor3 = Color3.fromRGB(24, 24, 29)
+sidebar.BorderSizePixel = 0
+sidebar.Parent = frame
+Instance.new("UICorner", sidebar).CornerRadius = UDim.new(0, 8)
+
+local sidebarLayout = Instance.new("UIListLayout", sidebar)
+sidebarLayout.Padding = UDim.new(0, 4)
+sidebarLayout.SortOrder = Enum.SortOrder.LayoutOrder
+local sidebarPad = Instance.new("UIPadding", sidebar)
+sidebarPad.PaddingTop = UDim.new(0, 6)
+sidebarPad.PaddingLeft = UDim.new(0, 6)
+sidebarPad.PaddingRight = UDim.new(0, 6)
+sidebarPad.PaddingBottom = UDim.new(0, 6)
+
+-- Tab 1: Dịch chuyển (Đang hoạt động)
+local tabTeleportBtn = Instance.new("TextButton")
+tabTeleportBtn.Name = "Tab_Teleport"
+tabTeleportBtn.LayoutOrder = 1
+tabTeleportBtn.Size = UDim2.new(1, 0, 0, 32)
+tabTeleportBtn.BackgroundColor3 = Color3.fromRGB(0, 140, 70)
+tabTeleportBtn.TextColor3 = Color3.new(1, 1, 1)
+tabTeleportBtn.Font = Enum.Font.GothamBold
+tabTeleportBtn.TextSize = 12
+tabTeleportBtn.Text = "⚡ Dịch chuyển"
+tabTeleportBtn.AutoButtonColor = false
+tabTeleportBtn.Parent = sidebar
+Instance.new("UICorner", tabTeleportBtn).CornerRadius = UDim.new(0, 6)
+
+-- Tab 2: Bypass Teleport (Tính năng thứ 2 trong menu)
+local tabBypassBtn = Instance.new("TextButton")
+tabBypassBtn.Name = "Tab_Bypass"
+tabBypassBtn.LayoutOrder = 2
+tabBypassBtn.Size = UDim2.new(1, 0, 0, 32)
+tabBypassBtn.BackgroundColor3 = Color3.fromRGB(32, 32, 38)
+tabBypassBtn.TextColor3 = Color3.fromRGB(160, 160, 175)
+tabBypassBtn.Font = Enum.Font.GothamMedium
+tabBypassBtn.TextSize = 11
+tabBypassBtn.Text = "🚀 Bypass Teleport"
+tabBypassBtn.AutoButtonColor = false
+tabBypassBtn.Parent = sidebar
+Instance.new("UICorner", tabBypassBtn).CornerRadius = UDim.new(0, 6)
+
+-- Tab 3: Toạ độ (Hiển thị tọa độ X, Y, Z realtime trên màn hình)
+local tabMiscBtn = Instance.new("TextButton")
+tabMiscBtn.Name = "Tab_Misc"
+tabMiscBtn.LayoutOrder = 3
+tabMiscBtn.Size = UDim2.new(1, 0, 0, 32)
+tabMiscBtn.BackgroundColor3 = Color3.fromRGB(32, 32, 38)
+tabMiscBtn.TextColor3 = Color3.fromRGB(160, 160, 175)
+tabMiscBtn.Font = Enum.Font.GothamMedium
+tabMiscBtn.TextSize = 11
+tabMiscBtn.Text = "📍 Toạ độ (HUD)"
+tabMiscBtn.AutoButtonColor = false
+tabMiscBtn.Parent = sidebar
+Instance.new("UICorner", tabMiscBtn).CornerRadius = UDim.new(0, 6)
+
+-- =========================================================================
+-- KHU VỰC NỘI DUNG CHÍNH (CONTENT AREA)
+-- =========================================================================
+local contentArea = Instance.new("Frame")
+contentArea.Name = "ContentArea"
+contentArea.Size = UDim2.new(1, -150, 1, -44)
+contentArea.Position = UDim2.fromOffset(142, 38)
+contentArea.BackgroundTransparency = 1
+contentArea.Parent = frame
+
+-- --- TRANG 1: TAB DỊCH CHUYỂN CHIẾN ĐẤU (BACKSTEP TELEPORT) ---
+local pageTeleport = Instance.new("Frame")
+pageTeleport.Name = "Page_Teleport"
+pageTeleport.Size = UDim2.new(1, 0, 1, 0)
+pageTeleport.BackgroundTransparency = 1
+pageTeleport.Visible = true
+pageTeleport.Parent = contentArea
+
+-- Nút Bật/Tắt Dịch chuyển chính
+local mainToggleBtn = Instance.new("TextButton")
+mainToggleBtn.Name = "MainToggleBtn"
+mainToggleBtn.Size = UDim2.new(1, 0, 0, 36)
+mainToggleBtn.Position = UDim2.fromOffset(0, 0)
+mainToggleBtn.BackgroundColor3 = Color3.fromRGB(36, 36, 42)
+mainToggleBtn.TextColor3 = Color3.fromRGB(220, 220, 220)
+mainToggleBtn.Font = Enum.Font.GothamBold
+mainToggleBtn.TextSize = 13
+mainToggleBtn.Text = "🔴 DỊCH CHUYỂN: ĐANG TẮT"
+mainToggleBtn.AutoButtonColor = false
+mainToggleBtn.Parent = pageTeleport
+Instance.new("UICorner", mainToggleBtn).CornerRadius = UDim.new(0, 8)
+
+-- Cụm điều khiển Sliders & Mục tiêu (Chia 2 cột cân đối)
+local controlsContainer = Instance.new("Frame")
+controlsContainer.Name = "Controls"
+controlsContainer.Size = UDim2.new(1, 0, 1, -44)
+controlsContainer.Position = UDim2.fromOffset(0, 44)
+controlsContainer.BackgroundTransparency = 1
+controlsContainer.Parent = pageTeleport
+
+-- CỘT TRÁI: ĐIỀU CHỈNH CỰ LY & THỜI GIAN HỒI
+local leftCol = Instance.new("Frame")
+leftCol.Name = "LeftColumn"
+leftCol.Size = UDim2.new(0, 150, 1, 0)
+leftCol.Position = UDim2.fromOffset(0, 0)
+leftCol.BackgroundColor3 = Color3.fromRGB(24, 24, 29)
+leftCol.BorderSizePixel = 0
+leftCol.Parent = controlsContainer
+Instance.new("UICorner", leftCol).CornerRadius = UDim.new(0, 8)
+
+-- Slider 1: Cự ly sau lưng
+local distLabel = Instance.new("TextLabel")
+distLabel.Name = "DistLabel"
+distLabel.Size = UDim2.new(1, -12, 0, 16)
+distLabel.Position = UDim2.fromOffset(8, 8)
+distLabel.BackgroundTransparency = 1
+distLabel.Font = Enum.Font.GothamMedium
+distLabel.TextSize = 11
+distLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+distLabel.TextXAlignment = Enum.TextXAlignment.Left
+distLabel.Text = "Cự ly: 4 studs"
+distLabel.Parent = leftCol
+
+local distSliderTrack = Instance.new("Frame")
+distSliderTrack.Name = "DistSliderTrack"
+distSliderTrack.Size = UDim2.new(1, -16, 0, 8)
+distSliderTrack.Position = UDim2.fromOffset(8, 28)
+distSliderTrack.BackgroundColor3 = Color3.fromRGB(48, 48, 56)
+distSliderTrack.BorderSizePixel = 0
+distSliderTrack.Parent = leftCol
+Instance.new("UICorner", distSliderTrack).CornerRadius = UDim.new(1, 0)
+
+local distSliderFill = Instance.new("Frame")
+distSliderFill.Name = "Fill"
+distSliderFill.Size = UDim2.new((BEHIND_DISTANCE - 1) / 14, 0, 1, 0)
+distSliderFill.BackgroundColor3 = Color3.fromRGB(0, 200, 100)
+distSliderFill.BorderSizePixel = 0
+distSliderFill.Parent = distSliderTrack
+Instance.new("UICorner", distSliderFill).CornerRadius = UDim.new(1, 0)
+
+-- Slider 2: Hồi chiêu
+local cdLabel = Instance.new("TextLabel")
+cdLabel.Name = "CdLabel"
+cdLabel.Size = UDim2.new(1, -12, 0, 16)
+cdLabel.Position = UDim2.fromOffset(8, 46)
+cdLabel.BackgroundTransparency = 1
+cdLabel.Font = Enum.Font.GothamMedium
+cdLabel.TextSize = 11
+cdLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+cdLabel.TextXAlignment = Enum.TextXAlignment.Left
+cdLabel.Text = "Hồi chiêu: 0.01s"
+cdLabel.Parent = leftCol
+
+local cdSliderTrack = Instance.new("Frame")
+cdSliderTrack.Name = "CdSliderTrack"
+cdSliderTrack.Size = UDim2.new(1, -16, 0, 8)
+cdSliderTrack.Position = UDim2.fromOffset(8, 66)
+cdSliderTrack.BackgroundColor3 = Color3.fromRGB(48, 48, 56)
+cdSliderTrack.BorderSizePixel = 0
+cdSliderTrack.Parent = leftCol
+Instance.new("UICorner", cdSliderTrack).CornerRadius = UDim.new(1, 0)
+
+local cdSliderFill = Instance.new("Frame")
+cdSliderFill.Name = "Fill"
+cdSliderFill.Size = UDim2.new((COOLDOWN - 0.0001) / 0.5, 0, 1, 0)
+cdSliderFill.BackgroundColor3 = Color3.fromRGB(70, 150, 255)
+cdSliderFill.BorderSizePixel = 0
+cdSliderFill.Parent = cdSliderTrack
+Instance.new("UICorner", cdSliderFill).CornerRadius = UDim.new(1, 0)
+
+-- Thông tin bổ sung ở cột trái
+local hintLabel = Instance.new("TextLabel")
+hintLabel.Name = "HintLabel"
+hintLabel.Size = UDim2.new(1, -16, 0, 80)
+hintLabel.Position = UDim2.fromOffset(8, 86)
+hintLabel.BackgroundTransparency = 1
+hintLabel.Font = Enum.Font.Gotham
+hintLabel.TextSize = 10
+hintLabel.TextColor3 = Color3.fromRGB(150, 150, 160)
+hintLabel.TextWrapped = true
+hintLabel.TextXAlignment = Enum.TextXAlignment.Left
+hintLabel.TextYAlignment = Enum.TextYAlignment.Top
+hintLabel.Text = "• Tự động dịch chuyển sau lưng khi xuất chiêu M1 (1-4) hoặc bị đánh.\n• Ổ khóa 🔒 đồng bộ vị trí nút nổi và bảng menu."
+hintLabel.Parent = leftCol
+
+-- CỘT PHẢI: TÌM KIẾM & CHỌN MỤC TIÊU NGƯỜI CHƠI
+local targetContainer = Instance.new("Frame")
+targetContainer.Name = "TargetContainer"
+targetContainer.Size = UDim2.new(1, -158, 1, 0)
+targetContainer.Position = UDim2.fromOffset(158, 0)
+targetContainer.BackgroundTransparency = 1
+targetContainer.Parent = controlsContainer
+
+-- Ô tìm kiếm người chơi
+local searchBox = Instance.new("TextBox")
+searchBox.Name = "Search"
+searchBox.Size = UDim2.new(1, 0, 0, 26)
+searchBox.Position = UDim2.fromOffset(0, 0)
+searchBox.BackgroundColor3 = Color3.fromRGB(24, 24, 29)
+searchBox.TextColor3 = Color3.new(1, 1, 1)
+searchBox.PlaceholderColor3 = Color3.fromRGB(130, 130, 140)
+searchBox.PlaceholderText = "🔍 Tìm kiếm người chơi..."
+searchBox.ClearTextOnFocus = false
+searchBox.TextXAlignment = Enum.TextXAlignment.Left
+searchBox.Font = Enum.Font.Gotham
+searchBox.TextSize = 11
+searchBox.Parent = targetContainer
+Instance.new("UICorner", searchBox).CornerRadius = UDim.new(0, 6)
+local searchPad = Instance.new("UIPadding", searchBox)
+searchPad.PaddingLeft = UDim.new(0, 6)
+searchPad.PaddingRight = UDim.new(0, 6)
+
+local clearBtn = Instance.new("TextButton")
+clearBtn.Name = "ClearSearch"
+clearBtn.Size = UDim2.fromOffset(26, 26)
+clearBtn.Position = UDim2.new(1, -26, 0, 0)
+clearBtn.BackgroundColor3 = Color3.fromRGB(34, 34, 42)
+clearBtn.TextColor3 = Color3.fromRGB(200, 200, 200)
+clearBtn.Font = Enum.Font.GothamBold
+clearBtn.TextSize = 12
+clearBtn.Text = "✕"
+clearBtn.AutoButtonColor = false
+clearBtn.Parent = targetContainer
+Instance.new("UICorner", clearBtn).CornerRadius = UDim.new(0, 6)
+
+-- Dòng trạng thái người chơi
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Name = "Status"
+statusLabel.Size = UDim2.new(1, 0, 0, 14)
+statusLabel.Position = UDim2.fromOffset(2, 28)
+statusLabel.BackgroundTransparency = 1
+statusLabel.TextColor3 = Color3.fromRGB(150, 150, 160)
+statusLabel.Font = Enum.Font.Gotham
+statusLabel.TextSize = 10
+statusLabel.TextWrapped = true
+statusLabel.TextTruncate = Enum.TextTruncate.AtEnd
+statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+statusLabel.Text = ""
+statusLabel.Parent = targetContainer
+
+-- Danh sách cuộn người chơi
+local list = Instance.new("ScrollingFrame")
+list.Name = "PlayerList"
+list.Size = UDim2.new(1, 0, 1, -44)
+list.Position = UDim2.fromOffset(0, 44)
+list.BackgroundColor3 = Color3.fromRGB(24, 24, 29)
+list.BorderSizePixel = 0
+list.ScrollBarThickness = 3
+list.CanvasSize = UDim2.new()
+list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+list.Parent = targetContainer
+Instance.new("UICorner", list).CornerRadius = UDim.new(0, 6)
+
+local layout = Instance.new("UIListLayout", list)
+layout.Padding = UDim.new(0, 3)
+layout.SortOrder = Enum.SortOrder.LayoutOrder
+local pad = Instance.new("UIPadding", list)
+pad.PaddingTop = UDim.new(0, 4)
+pad.PaddingLeft = UDim.new(0, 4)
+pad.PaddingRight = UDim.new(0, 4)
+pad.PaddingBottom = UDim.new(0, 4)
+
+local noneBtn = Instance.new("TextButton")
+noneBtn.Name = "NoTarget"
+noneBtn.LayoutOrder = 0
+noneBtn.Size = UDim2.new(1, 0, 0, 24)
+noneBtn.BackgroundColor3 = Color3.fromRGB(0, 140, 70)
+noneBtn.TextColor3 = Color3.new(1, 1, 1)
+noneBtn.Font = Enum.Font.GothamBold
+noneBtn.TextSize = 11
+noneBtn.Text = "Không mục tiêu (tự động)"
+noneBtn.AutoButtonColor = false
+noneBtn.Visible = true
+noneBtn.Parent = list
+Instance.new("UICorner", noneBtn).CornerRadius = UDim.new(0, 5)
+
+local emptyLabel = Instance.new("TextLabel")
+emptyLabel.Name = "Empty"
+emptyLabel.LayoutOrder = 100000
+emptyLabel.Size = UDim2.new(1, 0, 0, 30)
+emptyLabel.BackgroundTransparency = 1
+emptyLabel.TextColor3 = Color3.fromRGB(255, 130, 130)
+emptyLabel.Font = Enum.Font.Gotham
+emptyLabel.TextSize = 11
+emptyLabel.TextWrapped = true
+emptyLabel.Text = ""
+emptyLabel.Visible = false
+emptyLabel.Parent = list
+
+-- --- TRANG 2: BYPASS TELEPORT (TÍNH NĂNG THỨ 2 TRONG MENU) ---
+local pageBypass = Instance.new("Frame")
+pageBypass.Name = "Page_Bypass"
+pageBypass.Size = UDim2.new(1, 0, 1, 0)
+pageBypass.BackgroundTransparency = 1
+pageBypass.Visible = false
+pageBypass.Parent = contentArea
+
+-- Nút Bật/Tắt Bypass Teleport và Nút Hủy (Cancel)
+local bypassToggleBtn = Instance.new("TextButton")
+bypassToggleBtn.Name = "BypassToggleBtn"
+bypassToggleBtn.Size = UDim2.new(1, -95, 0, 36)
+bypassToggleBtn.Position = UDim2.fromOffset(0, 0)
+bypassToggleBtn.BackgroundColor3 = Color3.fromRGB(0, 140, 70)
+bypassToggleBtn.TextColor3 = Color3.new(1, 1, 1)
+bypassToggleBtn.Font = Enum.Font.GothamBold
+bypassToggleBtn.TextSize = 11
+bypassToggleBtn.Text = "▶ BẮT ĐẦU BYPASS TELEPORT"
+bypassToggleBtn.AutoButtonColor = false
+bypassToggleBtn.Parent = pageBypass
+Instance.new("UICorner", bypassToggleBtn).CornerRadius = UDim.new(0, 8)
+
+local bypassCancelBtn = Instance.new("TextButton")
+bypassCancelBtn.Name = "BypassCancelBtn"
+bypassCancelBtn.Size = UDim2.fromOffset(90, 36)
+bypassCancelBtn.Position = UDim2.new(1, -90, 0, 0)
+bypassCancelBtn.BackgroundColor3 = Color3.fromRGB(160, 40, 40)
+bypassCancelBtn.TextColor3 = Color3.new(1, 1, 1)
+bypassCancelBtn.Font = Enum.Font.GothamBold
+bypassCancelBtn.TextSize = 11
+bypassCancelBtn.Text = "✕ HỦY (CANCEL)"
+bypassCancelBtn.AutoButtonColor = false
+bypassCancelBtn.Parent = pageBypass
+Instance.new("UICorner", bypassCancelBtn).CornerRadius = UDim.new(0, 8)
+
+-- Khung hiển thị Trạng thái & Bộ đếm thời gian từ 0 đến 3 giây
+local bypassStatusBox = Instance.new("Frame")
+bypassStatusBox.Name = "BypassStatusBox"
+bypassStatusBox.Size = UDim2.new(1, 0, 0, 78)
+bypassStatusBox.Position = UDim2.fromOffset(0, 42)
+bypassStatusBox.BackgroundColor3 = Color3.fromRGB(24, 24, 29)
+bypassStatusBox.BorderSizePixel = 0
+bypassStatusBox.Parent = pageBypass
+Instance.new("UICorner", bypassStatusBox).CornerRadius = UDim.new(0, 8)
+
+local bypassStatusLabel = Instance.new("TextLabel")
+bypassStatusLabel.Name = "BypassStatusLabel"
+bypassStatusLabel.Size = UDim2.new(1, -12, 0, 16)
+bypassStatusLabel.Position = UDim2.fromOffset(6, 4)
+bypassStatusLabel.BackgroundTransparency = 1
+bypassStatusLabel.Font = Enum.Font.GothamMedium
+bypassStatusLabel.TextSize = 11
+bypassStatusLabel.TextColor3 = Color3.fromRGB(200, 200, 210)
+bypassStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+bypassStatusLabel.RichText = true
+bypassStatusLabel.Text = "Trạng thái: <font color=\"#AAAAAA\"><b>CHỜ BẮT ĐẦU (IDLE)</b></font>"
+bypassStatusLabel.Parent = bypassStatusBox
+
+local bypassTargetInfo = Instance.new("TextLabel")
+bypassTargetInfo.Name = "BypassTargetInfo"
+bypassTargetInfo.Size = UDim2.new(1, -12, 0, 14)
+bypassTargetInfo.Position = UDim2.fromOffset(6, 22)
+bypassTargetInfo.BackgroundTransparency = 1
+bypassTargetInfo.Font = Enum.Font.Gotham
+bypassTargetInfo.TextSize = 10
+bypassTargetInfo.TextColor3 = Color3.fromRGB(150, 150, 160)
+bypassTargetInfo.TextXAlignment = Enum.TextXAlignment.Left
+bypassTargetInfo.Text = "Tọa độ đích: X=1221.7, Y=209.7, Z=863.8 | Duy trì: 3.0s liên tục"
+bypassTargetInfo.Parent = bypassStatusBox
+
+local bypassTimerTrack = Instance.new("Frame")
+bypassTimerTrack.Name = "BypassTimerTrack"
+bypassTimerTrack.Size = UDim2.new(1, -12, 0, 8)
+bypassTimerTrack.Position = UDim2.fromOffset(6, 40)
+bypassTimerTrack.BackgroundColor3 = Color3.fromRGB(48, 48, 56)
+bypassTimerTrack.BorderSizePixel = 0
+bypassTimerTrack.Parent = bypassStatusBox
+Instance.new("UICorner", bypassTimerTrack).CornerRadius = UDim.new(1, 0)
+
+local bypassTimerFill = Instance.new("Frame")
+bypassTimerFill.Name = "Fill"
+bypassTimerFill.Size = UDim2.new(0, 0, 1, 0)
+bypassTimerFill.BackgroundColor3 = Color3.fromRGB(0, 200, 100)
+bypassTimerFill.BorderSizePixel = 0
+bypassTimerFill.Parent = bypassTimerTrack
+Instance.new("UICorner", bypassTimerFill).CornerRadius = UDim.new(1, 0)
+
+local bypassTimerLabel = Instance.new("TextLabel")
+bypassTimerLabel.Name = "BypassTimerLabel"
+bypassTimerLabel.Size = UDim2.new(1, -12, 0, 16)
+bypassTimerLabel.Position = UDim2.fromOffset(6, 54)
+bypassTimerLabel.BackgroundTransparency = 1
+bypassTimerLabel.Font = Enum.Font.GothamMedium
+bypassTimerLabel.TextSize = 11
+bypassTimerLabel.TextColor3 = Color3.fromRGB(220, 220, 230)
+bypassTimerLabel.TextXAlignment = Enum.TextXAlignment.Left
+bypassTimerLabel.RichText = true
+bypassTimerLabel.Text = "Bộ đếm thời gian: <b>0.00s / 3.00s</b> (0%)"
+bypassTimerLabel.Parent = bypassStatusBox
+
+-- Khung mô tả hướng dẫn và quy tắc kiểm tra
+local bypassGuideBox = Instance.new("Frame")
+bypassGuideBox.Name = "BypassGuideBox"
+bypassGuideBox.Size = UDim2.new(1, 0, 1, -126)
+bypassGuideBox.Position = UDim2.fromOffset(0, 126)
+bypassGuideBox.BackgroundColor3 = Color3.fromRGB(24, 24, 29)
+bypassGuideBox.BorderSizePixel = 0
+bypassGuideBox.Parent = pageBypass
+Instance.new("UICorner", bypassGuideBox).CornerRadius = UDim.new(0, 8)
+
+local bypassGuideText = Instance.new("TextLabel")
+bypassGuideText.Size = UDim2.new(1, -16, 1, -8)
+bypassGuideText.Position = UDim2.fromOffset(8, 4)
+bypassGuideText.BackgroundTransparency = 1
+bypassGuideText.Font = Enum.Font.Gotham
+bypassGuideText.TextSize = 10
+bypassGuideText.TextColor3 = Color3.fromRGB(160, 160, 175)
+bypassGuideText.TextXAlignment = Enum.TextXAlignment.Left
+bypassGuideText.TextYAlignment = Enum.TextYAlignment.Top
+bypassGuideText.RichText = true
+bypassGuideText.Text = "• <b>Bước 1:</b> Dịch chuyển tới tọa độ cố định (1221.7, 209.7, 863.8).\n• <b>Bước 2:</b> Khi đến đích hợp lệ, bộ đếm bắt đầu tính từ 0.0s đến 3.0s.\n• <b>Bước 3:</b> Nếu bị lệch/mất máu: Khóa toàn bộ chiêu, Ragdoll ngã tự nhiên, Reset.\n• <b>Bước 4:</b> Chờ hồi sinh hoàn toàn (khóa chiêu/đòn đánh tuyệt đối khi 0 HP).\n• <b>Bước 5:</b> Nhân vật mới sẵn sàng -> Tự động thử lại đến khi đủ 3s.\n• <b>Bước 6:</b> Thành công (Success) -> Hoàn thành và tự động dừng."
+bypassGuideText.Parent = bypassGuideBox
+
+-- --- TRANG 3: CHỨC NĂNG TOẠ ĐỘ (TÍNH NĂNG MỚI THEO YÊU CẦU) ---
+local pageMisc = Instance.new("Frame")
+pageMisc.Name = "Page_Misc"
+pageMisc.Size = UDim2.new(1, 0, 1, 0)
+pageMisc.BackgroundTransparency = 1
+pageMisc.Visible = false
+pageMisc.Parent = contentArea
+
+-- Nút Bật/Tắt chức năng Toạ độ
+local coordToggleBtn = Instance.new("TextButton")
+coordToggleBtn.Name = "CoordToggleBtn"
+coordToggleBtn.Size = UDim2.new(1, 0, 0, 36)
+coordToggleBtn.Position = UDim2.fromOffset(0, 0)
+coordToggleBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 52)
+coordToggleBtn.TextColor3 = Color3.new(1, 1, 1)
+coordToggleBtn.Font = Enum.Font.GothamBold
+coordToggleBtn.TextSize = 12
+coordToggleBtn.Text = "📍 TOẠ ĐỘ: ĐANG TẮT"
+coordToggleBtn.AutoButtonColor = false
+coordToggleBtn.Parent = pageMisc
+Instance.new("UICorner", coordToggleBtn).CornerRadius = UDim.new(0, 8)
+
+-- Khung hiển thị thông tin Toạ độ và Live Preview
+local coordInfoBox = Instance.new("Frame")
+coordInfoBox.Name = "CoordInfoBox"
+coordInfoBox.Size = UDim2.new(1, 0, 0, 78)
+coordInfoBox.Position = UDim2.fromOffset(0, 42)
+coordInfoBox.BackgroundColor3 = Color3.fromRGB(24, 24, 29)
+coordInfoBox.BorderSizePixel = 0
+coordInfoBox.Parent = pageMisc
+Instance.new("UICorner", coordInfoBox).CornerRadius = UDim.new(0, 8)
+
+local coordTitle = Instance.new("TextLabel")
+coordTitle.Name = "CoordTitle"
+coordTitle.Size = UDim2.new(1, -16, 0, 18)
+coordTitle.Position = UDim2.fromOffset(8, 6)
+coordTitle.BackgroundTransparency = 1
+coordTitle.Font = Enum.Font.GothamBold
+coordTitle.TextSize = 11
+coordTitle.TextColor3 = Color3.fromRGB(0, 255, 120)
+coordTitle.TextXAlignment = Enum.TextXAlignment.Left
+coordTitle.Text = "📍 BẢNG HIỂN THỊ TỌA ĐỘ MÀN HÌNH (HUD)"
+coordTitle.Parent = coordInfoBox
+
+local coordPreviewLabel = Instance.new("TextLabel")
+coordPreviewLabel.Name = "CoordPreviewLabel"
+coordPreviewLabel.Size = UDim2.new(1, -16, 0, 22)
+coordPreviewLabel.Position = UDim2.fromOffset(8, 26)
+coordPreviewLabel.BackgroundTransparency = 1
+coordPreviewLabel.Font = Enum.Font.Code
+coordPreviewLabel.TextSize = 13
+coordPreviewLabel.TextColor3 = Color3.fromRGB(0, 255, 0)
+coordPreviewLabel.TextXAlignment = Enum.TextXAlignment.Left
+coordPreviewLabel.Text = "  Chức năng toạ độ đang tắt."
+coordPreviewLabel.Parent = coordInfoBox
+
+local coordDescLabel = Instance.new("TextLabel")
+coordDescLabel.Name = "CoordDescLabel"
+coordDescLabel.Size = UDim2.new(1, -16, 0, 16)
+coordDescLabel.Position = UDim2.fromOffset(8, 52)
+coordDescLabel.BackgroundTransparency = 1
+coordDescLabel.Font = Enum.Font.Gotham
+coordDescLabel.TextSize = 10
+coordDescLabel.TextColor3 = Color3.fromRGB(150, 150, 160)
+coordDescLabel.TextXAlignment = Enum.TextXAlignment.Left
+coordDescLabel.Text = "Vị trí HUD: Góc trên trái màn hình (10, 10) • Kích thước: 220 x 70 px"
+coordDescLabel.Parent = coordInfoBox
+
+-- Hướng dẫn chi tiết tính năng Toạ độ
+local coordGuideBox = Instance.new("Frame")
+coordGuideBox.Name = "CoordGuideBox"
+coordGuideBox.Size = UDim2.new(1, 0, 1, -126)
+coordGuideBox.Position = UDim2.fromOffset(0, 126)
+coordGuideBox.BackgroundColor3 = Color3.fromRGB(24, 24, 29)
+coordGuideBox.BorderSizePixel = 0
+coordGuideBox.Parent = pageMisc
+Instance.new("UICorner", coordGuideBox).CornerRadius = UDim.new(0, 8)
+
+local coordGuideText = Instance.new("TextLabel")
+coordGuideText.Size = UDim2.new(1, -16, 1, -8)
+coordGuideText.Position = UDim2.fromOffset(8, 4)
+coordGuideText.BackgroundTransparency = 1
+coordGuideText.Font = Enum.Font.Gotham
+coordGuideText.TextSize = 10
+coordGuideText.TextColor3 = Color3.fromRGB(160, 160, 175)
+coordGuideText.TextXAlignment = Enum.TextXAlignment.Left
+coordGuideText.TextYAlignment = Enum.TextYAlignment.Top
+coordGuideText.RichText = true
+coordGuideText.Text = "• <b>Tên giao diện:</b> CoordinateDisplayGUI (ScreenGui, ResetOnSpawn = false).\n• <b>Định dạng hiển thị:</b> 3 dòng X, Y, Z với 1 chữ số thập phân, màu xanh lá neon (#00FF00), phông Enum.Font.Code.\n• <b>Tối ưu hóa:</b> RenderStepped chỉ chạy khi BẬT. Khi TẮT, kết nối RenderStepped sẽ được ngắt để không tốn tài nguyên và giữ FPS tối đa."
+coordGuideText.Parent = coordGuideBox
+
+-- =========================================================================
+-- CHUYỂN ĐỔI TAB (TAB SWITCHER)
+-- =========================================================================
+local function switchTab(tabIndex)
+	pageTeleport.Visible = (tabIndex == 1)
+	pageBypass.Visible = (tabIndex == 2)
+	pageMisc.Visible = (tabIndex == 3)
+
+	tabTeleportBtn.BackgroundColor3 = (tabIndex == 1) and Color3.fromRGB(0, 140, 70) or Color3.fromRGB(32, 32, 38)
+	tabTeleportBtn.TextColor3 = (tabIndex == 1) and Color3.new(1, 1, 1) or Color3.fromRGB(160, 160, 175)
+
+	tabBypassBtn.BackgroundColor3 = (tabIndex == 2) and Color3.fromRGB(0, 140, 70) or Color3.fromRGB(32, 32, 38)
+	tabBypassBtn.TextColor3 = (tabIndex == 2) and Color3.new(1, 1, 1) or Color3.fromRGB(160, 160, 175)
+
+	tabMiscBtn.BackgroundColor3 = (tabIndex == 3) and Color3.fromRGB(0, 140, 70) or Color3.fromRGB(32, 32, 38)
+	tabMiscBtn.TextColor3 = (tabIndex == 3) and Color3.new(1, 1, 1) or Color3.fromRGB(160, 160, 175)
+end
+
+tabTeleportBtn.Activated:Connect(function() switchTab(1) end)
+tabBypassBtn.Activated:Connect(function() switchTab(2) end)
+tabMiscBtn.Activated:Connect(function() switchTab(3) end)
+
+-- Thông báo nổi (Notice Banner)
+local notice = Instance.new("TextLabel")
+notice.Name = "Notice"
+notice.Size = UDim2.new(1, -20, 0, 24)
+notice.Position = UDim2.new(0, 10, 1, -30)
+notice.BackgroundColor3 = Color3.fromRGB(30, 30, 36)
+notice.TextColor3 = Color3.fromRGB(255, 200, 80)
+notice.Font = Enum.Font.GothamMedium
+notice.TextSize = 11
+notice.TextWrapped = true
+notice.Visible = false
+notice.ZIndex = 10
+notice.Parent = frame
+Instance.new("UICorner", notice).CornerRadius = UDim.new(0, 6)
+
+local noticeToken = 0
+local function showNotice(text, color, duration)
+	noticeToken += 1
+	local myToken = noticeToken
+	notice.Text = text
+	notice.TextColor3 = color or Color3.fromRGB(255, 200, 80)
+	notice.Visible = true
+	task.delay(duration or 4, function()
+		if noticeToken == myToken then notice.Visible = false end
+	end)
+end
+
+-- =========================================================================
+-- 3. HỆ THỐNG KÉO THẢ VÀ KHÓA VỊ TRÍ ĐỒNG BỘ (SYNCHRONIZED LOCK SYSTEM)
+-- =========================================================================
+local function updateLockVisual()
+	if isFloatLocked then
+		lockBtn.Text = "🔒"
+		lockBtn.TextColor3 = Color3.fromRGB(255, 90, 90)
+		lockStroke.Color = Color3.fromRGB(220, 60, 60)
+	else
+		lockBtn.Text = "🔓"
+		lockBtn.TextColor3 = Color3.fromRGB(200, 200, 200)
+		lockStroke.Color = Color3.fromRGB(70, 70, 80)
+	end
+end
+
+local function toggleLock()
+	isFloatLocked = not isFloatLocked
+	updateLockVisual()
+	if isFloatLocked then
+		showNotice("🔒 Đã khóa vị trí: Không thể kéo thả cụm nút nổi & menu!", Color3.fromRGB(255, 110, 110), 2.5)
+	else
+		showNotice("🔓 Đã mở khóa: Bạn có thể kéo thả di chuyển tự do!", Color3.fromRGB(0, 230, 120), 2.5)
+	end
+end
+
+lockBtn.Activated:Connect(toggleLock)
+
+-- Kéo thả cụm nút nổi (FloatCluster Dragging)
+local draggingFloat = false
+local dragStartPos = nil
+local clusterStartPos = nil
+local floatMovedSignificantly = false
+
+floatBtn.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		if not isFloatLocked then
+			draggingFloat = true
+			dragStartPos = input.Position
+			clusterStartPos = floatCluster.Position
+			floatMovedSignificantly = false
+		end
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+	if draggingFloat and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+		if isFloatLocked then
+			draggingFloat = false
+			return
+		end
+		local delta = input.Position - dragStartPos
+		if delta.Magnitude > 6 then
+			floatMovedSignificantly = true
+		end
+		local newX = clusterStartPos.X.Offset + delta.X
+		local newY = clusterStartPos.Y.Offset + delta.Y
+		floatCluster.Position = getClampedPosition(Vector2.new(newX, newY), Vector2.new(88, 48))
+	end
+end)
+
+local function endFloatDrag()
+	if draggingFloat then
+		draggingFloat = false
+	end
+end
+
+floatBtn.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		endFloatDrag()
+	end
+end)
+UserInputService.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		endFloatDrag()
+	end
+end)
+
+-- Nhấn nút tròn: Thu gọn hoặc hiển thị menu chính
+floatBtn.Activated:Connect(function()
+	if floatMovedSignificantly and not isFloatLocked then
+		floatMovedSignificantly = false
+		return
+	end
+	frame.Visible = not frame.Visible
+	if frame.Visible then
+		showNotice("Đã mở menu chính", Color3.fromRGB(0, 230, 120), 1.5)
+	else
+		showNotice("Đã ẩn menu (Chức năng vẫn chạy ngầm)", Color3.fromRGB(200, 200, 200), 1.5)
+	end
+end)
+
+-- Đóng menu bằng nút [X] ở header: Menu ẩn đi nhưng script vẫn chạy ngầm 100%
+closeBtn.Activated:Connect(function()
+	frame.Visible = false
+	showNotice("Đã ẩn menu (Chức năng vẫn chạy ngầm)", Color3.fromRGB(200, 200, 200), 2)
+end)
+
+-- Kéo thả Menu chính (Main Frame Dragging)
+local draggingFrame = false
+local frameDragStart = nil
+local frameStartPos = nil
+
+headerBar.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		if not isFloatLocked then
+			draggingFrame = true
+			frameDragStart = input.Position
+			frameStartPos = frame.Position
+		else
+			showNotice("🔒 Menu đang khóa vị trí! Bấm ổ khóa để mở.", Color3.fromRGB(255, 120, 120), 2)
+		end
+	end
+end)
+
+headerBar.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		draggingFrame = false
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+	if draggingFrame and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+		if isFloatLocked then
+			draggingFrame = false
+			return
+		end
+		local delta = input.Position - frameDragStart
+		local newX = frameStartPos.X.Offset + delta.X
+		local newY = frameStartPos.Y.Offset + delta.Y
+		frame.Position = getClampedPosition(Vector2.new(newX, newY), Vector2.new(480, 305))
+	end
+end)
+
+-- =========================================================================
+-- 4. LOGIC KÉO SLIDERS (CỰ LY & THỜI GIAN HỒI CHIÊU)
+-- =========================================================================
+local draggingDist = false
+local draggingCd = false
+
+local function updateDistSlider(input)
+	local trackAbsPos = distSliderTrack.AbsolutePosition.X
+	local trackAbsSize = distSliderTrack.AbsoluteSize.X
+	local relX = math.clamp(input.Position.X - trackAbsPos, 0, trackAbsSize)
+	local pct = relX / trackAbsSize
+	BEHIND_DISTANCE = math.round(1 + pct * 14)
+	distSliderFill.Size = UDim2.new((BEHIND_DISTANCE - 1) / 14, 0, 1, 0)
+	distLabel.Text = string.format("Cự ly: %d studs", BEHIND_DISTANCE)
+end
+
+distSliderTrack.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		draggingDist = true
+		updateDistSlider(input)
+	end
+end)
+
+local function updateCdSlider(input)
+	local trackAbsPos = cdSliderTrack.AbsolutePosition.X
+	local trackAbsSize = cdSliderTrack.AbsoluteSize.X
+	local relX = math.clamp(input.Position.X - trackAbsPos, 0, trackAbsSize)
+	local pct = relX / trackAbsSize
+	if pct <= 0.05 then
+		COOLDOWN = 0.0001
+	else
+		COOLDOWN = math.round((pct * 0.5) * 100) / 100
+	end
+	cdSliderFill.Size = UDim2.new(pct, 0, 1, 0)
+	if COOLDOWN < 0.01 then
+		cdLabel.Text = string.format("Hồi chiêu: %.4fs", COOLDOWN)
+	else
+		cdLabel.Text = string.format("Hồi chiêu: %.2fs", COOLDOWN)
+	end
+end
+
+cdSliderTrack.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		draggingCd = true
+		updateCdSlider(input)
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+		if draggingDist then updateDistSlider(input) end
+		if draggingCd then updateCdSlider(input) end
+	end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		draggingDist = false
+		draggingCd = false
+	end
+end)
+
+-- =========================================================================
+-- 5. DANH SÁCH NGƯỜI CHƠI & LỌC TÌM KIẾM
+-- =========================================================================
+local rows = {}
+local filterText = ""
+
+local function escapeRich(s)
+	return (s:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
+end
+
+local function setUI()
+	if enabled then
+		mainToggleBtn.Text = "🟢 DỊCH CHUYỂN: ĐANG BẬT"
+		mainToggleBtn.BackgroundColor3 = Color3.fromRGB(0, 140, 70)
+		floatStroke.Color = Color3.fromRGB(0, 230, 120)
+		floatBtn.TextColor3 = Color3.fromRGB(0, 230, 120)
+	else
+		mainToggleBtn.Text = "🔴 DỊCH CHUYỂN: ĐANG TẮT"
+		mainToggleBtn.BackgroundColor3 = Color3.fromRGB(36, 36, 42)
+		floatStroke.Color = Color3.fromRGB(70, 70, 80)
+		floatBtn.TextColor3 = Color3.fromRGB(160, 160, 170)
+	end
+
+	if selected then
+		statusLabel.Text = "Đang nhắm: " .. selected.DisplayName .. " (@" .. selected.Name .. ")"
+		statusLabel.TextColor3 = Color3.fromRGB(0, 230, 120)
+	else
+		statusLabel.Text = "Tự động nhắm người gần nhất"
+		statusLabel.TextColor3 = Color3.fromRGB(160, 160, 170)
+	end
+end
+
+mainToggleBtn.Activated:Connect(function()
+	enabled = not enabled
+	setUI()
+end)
+
+local function refreshRows()
+	noneBtn.BackgroundColor3 = (selected == nil) and Color3.fromRGB(0, 140, 70) or Color3.fromRGB(34, 34, 40)
+	for p, row in pairs(rows) do
+		if p == selected then
+			row.BackgroundColor3 = Color3.fromRGB(0, 120, 200)
+		else
+			row.BackgroundColor3 = Color3.fromRGB(32, 32, 38)
+		end
+	end
+end
+
+local function applyFilter()
+	filterText = string.lower(searchBox.Text)
+	local visibleCount = 0
+	for p, row in pairs(rows) do
+		local dName = string.lower(p.DisplayName)
+		local uName = string.lower(p.Name)
+		local match = (filterText == "") or string.find(dName, filterText, 1, true) or string.find(uName, filterText, 1, true)
+		row.Visible = match
+		if match then visibleCount += 1 end
+	end
+	emptyLabel.Visible = (visibleCount == 0 and filterText ~= "")
+	if emptyLabel.Visible then
+		emptyLabel.Text = "Không tìm thấy: \"" .. searchBox.Text .. "\""
+	end
+end
+
+local function resortRows()
+	local listArr = {}
+	for p, row in pairs(rows) do
+		table.insert(listArr, { player = p, row = row })
+	end
+	table.sort(listArr, function(a, b)
+		return string.lower(a.player.DisplayName) < string.lower(b.player.DisplayName)
+	end)
+	for idx, item in ipairs(listArr) do
+		item.row.LayoutOrder = idx + 1
+	end
+end
+
+local function addRow(p)
+	if p == lp or rows[p] then return end
+	local row = Instance.new("TextButton")
+	row.Name = string.lower(p.Name)
+	row.Size = UDim2.new(1, 0, 0, 28)
+	row.Text = ""
+	row.AutoButtonColor = false
+	row.Parent = list
+	Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
+
+	local label = Instance.new("TextLabel")
+	label.Name = "PlayerLabel"
+	label.BackgroundTransparency = 1
+	label.Position = UDim2.fromOffset(6, 0)
+	label.Size = UDim2.new(1, -12, 1, 0)
+	label.Font = Enum.Font.Gotham
+	label.TextSize = 12
+	label.TextColor3 = Color3.new(1, 1, 1)
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.TextTruncate = Enum.TextTruncate.AtEnd
+	label.RichText = true
+	if p.DisplayName ~= p.Name then
+		label.Text = "<b>" .. escapeRich(p.DisplayName) .. "</b> <font size=\"10\" color=\"#B4B4B4\">@"
+			.. escapeRich(p.Name) .. "</font>"
+	else
+		label.Text = "<b>" .. escapeRich(p.Name) .. "</b>"
+	end
+	label.Parent = row
+
+	row.Activated:Connect(function()
+		if selected == p then
+			selected = nil
+		else
+			selected = p
+		end
+		refreshRows()
+		setUI()
+	end)
+
+	rows[p] = row
+	resortRows()
+	applyFilter()
+	refreshRows()
+end
+
+local function removeRow(p)
+	local wasSelected = (selected == p)
+	if rows[p] then
+		rows[p]:Destroy()
+		rows[p] = nil
+	end
+	if wasSelected then
+		selected = nil
+		setUI()
+		showNotice("Mục tiêu " .. p.DisplayName .. " đã rời game. Đã về Tự động.", Color3.fromRGB(255, 200, 80), 6)
+	end
+	resortRows()
+	applyFilter()
+	refreshRows()
+end
+
+noneBtn.Activated:Connect(function()
+	selected = nil
+	refreshRows()
+	setUI()
+end)
+
+searchBox:GetPropertyChangedSignal("Text"):Connect(applyFilter)
+clearBtn.Activated:Connect(function() searchBox.Text = "" end)
+
+for _, p in ipairs(Players:GetPlayers()) do addRow(p) end
+Players.PlayerAdded:Connect(addRow)
+Players.PlayerRemoving:Connect(removeRow)
+
+-- =========================================================================
+-- 6. CORE LOGIC DỊCH CHUYỂN & MỤC TIÊU
+-- =========================================================================
+local function getRoot()
+	local c = lp.Character
+	return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function nearestEnemy(myPos)
+	local best, bestDist
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= lp and p.Character then
+			local r = p.Character:FindFirstChild("HumanoidRootPart")
+			local h = p.Character:FindFirstChildOfClass("Humanoid")
+			if r and h and h.Health > 0 then
+				local d = (r.Position - myPos).Magnitude
+				if not bestDist or d < bestDist then
+					best, bestDist = r, d
+				end
+			end
+		end
+	end
+	return best
+end
+
+local function getTargetRoot(myPos, preferred)
+	if selected then
+		local c = selected.Character
+		local r = c and c:FindFirstChild("HumanoidRootPart")
+		local h = c and c:FindFirstChildOfClass("Humanoid")
+		if r and h and h.Health > 0 then return r end
+		return nil
+	end
+	if preferred and preferred.Parent then return preferred end
+	return nearestEnemy(myPos)
+end
+
+local faceToken = 0
+local function holdFacing(enemyRoot)
+	if FACE_HOLD_TIME <= 0 then return end
+	faceToken += 1
+	local token = faceToken
+	local t0 = os.clock()
+	local conn
+	conn = RunService.Heartbeat:Connect(function()
+		local root = getRoot()
+		if token ~= faceToken or not root or not enemyRoot.Parent
+			or os.clock() - t0 > FACE_HOLD_TIME then
+			conn:Disconnect()
+			return
+		end
+		local d = Vector3.new(
+			enemyRoot.Position.X - root.Position.X, 0,
+			enemyRoot.Position.Z - root.Position.Z
+		)
+		if d.Magnitude < MIN_FACE_DISTANCE then return end
+		root.CFrame = CFrame.lookAt(root.Position, root.Position + d.Unit)
+	end)
+end
+
+-- Kiểm tra điều kiện dịch chuyển chiến đấu: Chỉ cho phép khi còn sống và KHÔNG trong lúc Reset/Ragdoll/Chờ hồi sinh
+local function canUseCombatTeleport()
+	if not enabled then return false end
+	local char = lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not hum or hum.Health <= 0 then return false end
+
+	-- Chặn hoàn toàn Backstep Teleport nếu nhân vật đang trong quá trình Ragdoll, Reset hoặc Chờ hồi sinh của Bypass Teleport
+	if bypassActive and (bypassState == "Ragdolling" or bypassState == "Resetting" or bypassState == "Waiting") then
+		return false
+	end
+	return true
+end
+
+local function teleportBehind(preferred)
+	if not canUseCombatTeleport() then return false end
+	if os.clock() - lastTrigger < COOLDOWN then return false end
+
+	local root = getRoot()
+	if not root then return false end
+
+	local enemy = getTargetRoot(root.Position, preferred)
+	if not enemy then return false end
+	lastTrigger = os.clock()
+
+	local myPos = root.Position
+	local enemyPos = enemy.Position
+
+	local look = enemy.CFrame.LookVector
+	local flat = Vector3.new(look.X, 0, look.Z)
+	if flat.Magnitude < 0.3 then
+		flat = Vector3.new(enemyPos.X - myPos.X, 0, enemyPos.Z - myPos.Z)
+		if flat.Magnitude < 0.01 then
+			local mine = root.CFrame.LookVector
+			flat = Vector3.new(mine.X, 0, mine.Z)
+			if flat.Magnitude < 0.01 then flat = Vector3.new(0, 0, -1) end
+		end
+	end
+	flat = flat.Unit
+
+	-- SỬ DỤNG TRỰC TIẾP BIẾN BEHIND_DISTANCE ĐÃ ĐƯỢC ĐIỀU CHỈNH QUA SLIDER
+	local pos = enemyPos - flat * BEHIND_DISTANCE
+	root.CFrame = CFrame.lookAt(pos, pos + flat)
+	root.AssemblyLinearVelocity = Vector3.zero
+	holdFacing(enemy)
+	return true
+end
+
+-- =========================================================================
+-- 7. BẢO TỒN NGUYÊN VẸN LOGIC M1 (1 ĐẾN 4), CHIÊU VÀ SÁT THƯƠNG
+-- =========================================================================
+local lastAnyTeleport = 0
+local lastSwingTeleport = 0
+
+local function onSwing(source)
+	if not canUseCombatTeleport() then return end
+	local now = os.clock()
+	if now - lastAnyTeleport < SWING_DEDUPE then return end
+	if teleportBehind() then
+		lastAnyTeleport = now
+		lastSwingTeleport = now
+		dbg("swing ->", source)
+	end
+end
+
+local function onHit(source, preferred)
+	if not canUseCombatTeleport() then return end
+	local now = os.clock()
+	if now - lastSwingTeleport < HIT_DEDUPE then return end
+	if teleportBehind(preferred) then
+		lastAnyTeleport = now
+		dbg("hit ->", source)
+	end
+end
+
+-- Hook khi bản thân mất máu
+local myConn
+local function hookSelf(char)
+	if myConn then myConn:Disconnect() end
+	local hum = char:WaitForChild("Humanoid")
+	local last = hum.Health
+	myConn = hum.HealthChanged:Connect(function(h)
+		if h < last then onHit("self") end
+		last = h
+	end)
+end
+
+if lp.Character then task.spawn(hookSelf, lp.Character) end
+lp.CharacterAdded:Connect(hookSelf)
+
+-- Hook khi đánh trúng đối thủ
+local function hookEnemy(p, char)
+	local hum = char:WaitForChild("Humanoid", 10)
+	local root = char:WaitForChild("HumanoidRootPart", 10)
+	if not hum or not root then return end
+	local last = hum.Health
+	hum.HealthChanged:Connect(function(h)
+		if h < last then
+			local myRoot = getRoot()
+			if myRoot and (root.Position - myRoot.Position).Magnitude < 25 then
+				onHit("enemy:" .. p.Name, root)
+			end
+		end
+		last = h
+	end)
+end
+
+for _, p in ipairs(Players:GetPlayers()) do
+	if p ~= lp then
+		if p.Character then task.spawn(hookEnemy, p, p.Character) end
+		p.CharacterAdded:Connect(function(c) hookEnemy(p, c) end)
+	end
+end
+Players.PlayerAdded:Connect(function(p)
+	if p ~= lp then
+		p.CharacterAdded:Connect(function(c) hookEnemy(p, c) end)
+	end
+end)
+
+-- 1) Input Bắt Đầu Chiêu & Đòn Đánh
+UserInputService.InputBegan:Connect(function(input, gpe)
+	if gpe then return end
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		onSwing("mouse1")
+	elseif input.UserInputType == Enum.UserInputType.Touch then
+		onSwing("touch")
+	elseif input.UserInputType == Enum.UserInputType.Keyboard then
+		if ATTACK_KEYCODES[input.KeyCode] then
+			onSwing("key:" .. input.KeyCode.Name)
+		end
+	end
+end)
+
+-- 2) Tool Được Kích Hoạt
+local function hookTool(tool)
+	if not tool:IsA("Tool") then return end
+	tool.Activated:Connect(function()
+		onSwing("tool:" .. tool.Name)
+	end)
+end
+
+local function hookToolContainer(container)
+	for _, t in ipairs(container:GetChildren()) do hookTool(t) end
+	container.ChildAdded:Connect(hookTool)
+end
+
+local function hookCharacterTools(char) hookToolContainer(char) end
+if lp.Character then hookCharacterTools(lp.Character) end
+lp.CharacterAdded:Connect(hookCharacterTools)
+
+task.spawn(function()
+	hookToolContainer(lp:WaitForChild("Backpack"))
+	lp.CharacterAdded:Connect(function()
+		hookToolContainer(lp:WaitForChild("Backpack"))
+	end)
+end)
+
+-- 3) LOGIC M1 THỨ 1 ĐẾN THỨ 4 & CHIÊU QUA ANIMATION
+local IGNORED_PRIORITY = {
+	[Enum.AnimationPriority.Core] = true,
+	[Enum.AnimationPriority.Idle] = true,
+	[Enum.AnimationPriority.Movement] = true,
+}
+
+local function isAttackTrack(tr)
+	if tr.Looped then return false end
+	if IGNORED_PRIORITY[tr.Priority] then return false end
+	if next(ATTACK_ANIM_IDS) ~= nil then
+		local id = tr.Animation and tr.Animation.AnimationId
+		return id ~= nil and ATTACK_ANIM_IDS[id] == true
+	end
+	return true
+end
+
+local activeTracks = {}
+
+RunService.Heartbeat:Connect(function()
+	if not DETECT_ANIM_ATTACKS then return end
+	if not canUseCombatTeleport() then
+		activeTracks = {}
+		return
+	end
+	local char = lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local animator = hum and hum:FindFirstChildOfClass("Animator")
+	if not animator then
+		activeTracks = {}
+		return
+	end
+
+	local nowPlaying = {}
+	for _, tr in ipairs(animator:GetPlayingAnimationTracks()) do
+		local t = tr.TimePosition
+		local prev = activeTracks[tr]
+		nowPlaying[tr] = t
+		-- Đòn đánh M1 (1, 2, 3, 4) bắt đầu hoặc track được phát lại
+		if prev == nil or t + 0.001 < prev then
+			dbg("anim", tr.Name, tr.Animation and tr.Animation.AnimationId,
+				tr.Priority.Name, "looped=" .. tostring(tr.Looped))
+			if isAttackTrack(tr) then
+				onSwing("anim:" .. tr.Name)
+			end
+		end
+	end
+	activeTracks = nowPlaying
+end)
+
+-- =========================================================================
+-- 8. CORE LOGIC VÀ MÁY TRẠNG THÁI BYPASS TELEPORT (TÍNH NĂNG THỨ 2)
+-- =========================================================================
+local ContextActionService = game:GetService("ContextActionService")
+local ACTION_BLOCKER_NAME = "BypassCombatActionBlocker"
+local isCombatBlocked = false
+local currentRagdollObjects = {}
+
+-- Khóa toàn bộ phím chiêu thức, đánh thường M1/M2, phím số 1-4 và Touch (Khắc phục lỗi HP = 0 vẫn bấm chiêu)
+local function lockCombatActions()
+	if isCombatBlocked then return end
+	isCombatBlocked = true
+
+	-- 1. Chặn toàn bộ Input chiêu thức (1, 2, 3, 4, Q, E, R, F, Z, X, C, V, M1, M2, Touch)
+	pcall(function()
+		ContextActionService:BindActionAtPriority(
+			ACTION_BLOCKER_NAME,
+			function(_, _, _)
+				return Enum.ContextActionResult.Sink
+			end,
+			false,
+			Enum.ContextActionPriority.High.Value + 3000,
+			Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three, Enum.KeyCode.Four,
+			Enum.KeyCode.Q, Enum.KeyCode.E, Enum.KeyCode.R, Enum.KeyCode.F,
+			Enum.KeyCode.Z, Enum.KeyCode.X, Enum.KeyCode.C, Enum.KeyCode.V,
+			Enum.UserInputType.MouseButton1, Enum.UserInputType.MouseButton2,
+			Enum.UserInputType.Touch
+		)
+	end)
+
+	-- 2. Dừng ngay lập tức toàn bộ animation đòn đánh/chiêu thức đang phát trên Animator
+	pcall(function()
+		local char = lp.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		local animator = hum and hum:FindFirstChildOfClass("Animator")
+		if animator then
+			for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+				track:Stop(0)
+			end
+		end
+		if hum then
+			hum:UnequipTools()
+		end
+	end)
+
+	-- 3. Vô hiệu hóa Tool trong Character và Backpack để không kích hoạt Tool.Activated
+	pcall(function()
+		local char = lp.Character
+		if char then
+			for _, item in ipairs(char:GetChildren()) do
+				if item:IsA("Tool") then
+					item.Enabled = false
+				end
+			end
+		end
+		local bp = lp:FindFirstChild("Backpack")
+		if bp then
+			for _, item in ipairs(bp:GetChildren()) do
+				if item:IsA("Tool") then
+					item.Enabled = false
+				end
+			end
+		end
+	end)
+end
+
+-- Mở khóa điều khiển chiêu thức khi nhân vật mới đã hồi sinh và sẵn sàng
+local function unlockCombatActions()
+	if not isCombatBlocked then return end
+	isCombatBlocked = false
+
+	pcall(function()
+		ContextActionService:UnbindAction(ACTION_BLOCKER_NAME)
+	end)
+
+	pcall(function()
+		local char = lp.Character
+		if char then
+			for _, item in ipairs(char:GetChildren()) do
+				if item:IsA("Tool") then
+					item.Enabled = true
+				end
+			end
+		end
+		local bp = lp:FindFirstChild("Backpack")
+		if bp then
+			for _, item in ipairs(bp:GetChildren()) do
+				if item:IsA("Tool") then
+					item.Enabled = true
+				end
+			end
+		end
+	end)
+end
+
+-- Dọn dẹp trạng thái Ragdoll và khôi phục khớp Motor6D
+local function cleanRagdoll()
+	for _, inst in ipairs(currentRagdollObjects) do
+		if inst and inst.Parent then
+			if inst:IsA("Motor6D") then
+				inst.Enabled = true
+			else
+				pcall(function() inst:Destroy() end)
+			end
+		end
+	end
+	table.clear(currentRagdollObjects)
+end
+
+-- Áp dụng hiệu ứng Ragdoll vật lý tự nhiên (phong cách Jujutsu Shenanigans / Roblox Physics)
+local function applyRagdoll(char, hum)
+	if not char or not hum then return end
+
+	-- 1. Khóa hoàn toàn chiêu thức và điều khiển di chuyển nhân vật ngay lập tức
+	lockCombatActions()
+
+	pcall(function()
+		hum.AutoRotate = false
+		hum.WalkSpeed = 0
+		hum.JumpPower = 0
+		hum.PlatformStand = true
+		hum:ChangeState(Enum.HumanoidStateType.Physics)
+	end)
+
+	cleanRagdoll()
+
+	-- 2. Thay thế liên kết Motor6D bằng BallSocketConstraint để các khớp ngã vật lý tự nhiên
+	for _, motor in ipairs(char:GetDescendants()) do
+		if motor:IsA("Motor6D") and motor.Name ~= "RootJoint" then
+			local p0 = motor.Part0
+			local p1 = motor.Part1
+			if p0 and p1 and p0:IsA("BasePart") and p1:IsA("BasePart") then
+				local att0 = Instance.new("Attachment")
+				att0.Name = "RagdollAtt0"
+				att0.CFrame = motor.C0
+				att0.Parent = p0
+
+				local att1 = Instance.new("Attachment")
+				att1.Name = "RagdollAtt1"
+				att1.CFrame = motor.C1
+				att1.Parent = p1
+
+				local socket = Instance.new("BallSocketConstraint")
+				socket.Name = "RagdollSocket"
+				socket.Attachment0 = att0
+				socket.Attachment1 = att1
+				socket.LimitsEnabled = true
+				socket.UpperAngle = 60
+				socket.TwistLimitsEnabled = true
+				socket.TwistLowerAngle = -45
+				socket.TwistUpperAngle = 45
+				socket.Parent = p0
+
+				motor.Enabled = false
+
+				table.insert(currentRagdollObjects, att0)
+				table.insert(currentRagdollObjects, att1)
+				table.insert(currentRagdollObjects, socket)
+				table.insert(currentRagdollObjects, motor)
+			end
+		end
+	end
+
+	-- Bật va chạm (CanCollide) cho tất cả các bộ phận cơ thể để tiếp đất vững, không bị rơi xuyên sàn
+	for _, part in ipairs(char:GetChildren()) do
+		if part:IsA("BasePart") then
+			if part.Name == "HumanoidRootPart" then
+				part.CanCollide = false
+			else
+				part.CanCollide = true
+			end
+		end
+	end
+
+	-- Trọng lực tự nhiên làm nhân vật sụp đổ tại chỗ, tuyệt đối không đẩy bay lên cao hoặc giật vị trí
+	local root = char:FindFirstChild("HumanoidRootPart")
+	if root then
+		root.AssemblyLinearVelocity = Vector3.new(0, -2, 0)
+		root.AssemblyAngularVelocity = Vector3.zero
+	end
+end
+
+-- Kích hoạt cái chết thật sự & ép máy chủ Roblox respawn (Khắc phục lỗi HP = 0 nhưng vẫn đứng hoặc dùng chiêu)
+local function forceCharacterDeath(char, hum, root)
+	if not char then return end
+
+	-- Bước 1: Khóa chặt input và chiêu thức
+	lockCombatActions()
+
+	-- Bước 2: Kích hoạt trạng thái chết của Humanoid
+	pcall(function()
+		if hum then
+			hum.Health = 0
+			hum:ChangeState(Enum.HumanoidStateType.Dead)
+		end
+	end)
+
+	-- Bước 3: Phá vỡ liên kết khớp theo chuẩn Roblox engine
+	pcall(function()
+		char:BreakJoints()
+	end)
+
+	-- Bước 4: Phá khớp Cổ (Neck) để đảm bảo engine ghi nhận tử vong nếu BreakJointsOnDeath bị tắt
+	pcall(function()
+		local head = char:FindFirstChild("Head")
+		local neck = (head and head:FindFirstChild("Neck")) or char:FindFirstChild("Neck", true)
+		if neck and neck:IsA("Motor6D") then
+			neck:Destroy()
+		end
+	end)
+
+	-- Lưu ý: Không ép teleport RootPart xuống -550 studs để tránh xác bị giật vị trí hoặc bay lên trời.
+	-- Trọng lực Roblox tự nhiên giữ xác tại mặt sàn cho đến khi nhân vật mới được máy chủ hồi sinh.
+end
+
+-- =========================================================================
+-- CẬP NHẬT GIAO DIỆN BYPASS TELEPORT
+-- =========================================================================
+local function updateBypassUI()
+	if not bypassStatusLabel then return end
+
+	local colorMap = {
+		Idle = Color3.fromRGB(170, 170, 180),
+		Teleporting = Color3.fromRGB(0, 200, 255),
+		Running = Color3.fromRGB(70, 150, 255),
+		Ragdolling = Color3.fromRGB(255, 140, 0),
+		Resetting = Color3.fromRGB(255, 80, 80),
+		Waiting = Color3.fromRGB(255, 170, 40),
+		Success = Color3.fromRGB(0, 230, 120),
+		Cancelled = Color3.fromRGB(255, 80, 80),
+	}
+
+	local textMap = {
+		Idle = "CHỜ BẮT ĐẦU (IDLE)",
+		Teleporting = "ĐANG DỊCH CHUYỂN (TELEPORT)",
+		Running = "ĐANG KIỂM TRA DUY TRÌ (3.0s)",
+		Ragdolling = "BỊ KÉO LỆCH - RAGDOLL TỰ NHIÊN",
+		Resetting = "RESET NHÂN VẬT (FORCE DEATH)",
+		Waiting = "CHỜ HỒI SINH HOÀN TOÀN (WAITING)",
+		Success = "HOÀN THÀNH (SUCCESS)",
+		Cancelled = "ĐÃ HỦY BỎ (CANCELLED)",
+	}
+
+	local curColor = colorMap[bypassState] or Color3.fromRGB(200, 200, 200)
+	local curText = textMap[bypassState] or bypassState
+	bypassStatusLabel.Text = "Trạng thái: <font color=\"#" .. curColor:ToHex() .. "\"><b>" .. curText .. "</b></font>"
+
+	local pct = math.clamp(bypassTimer / BYPASS_HOLD_TIME, 0, 1)
+	bypassTimerFill.Size = UDim2.new(pct, 0, 1, 0)
+	bypassTimerLabel.Text = string.format("Bộ đếm thời gian: <b>%.2fs / %.1fs</b> (%.0f%%)", bypassTimer, BYPASS_HOLD_TIME, pct * 100)
+
+	if bypassActive then
+		if bypassState == "Teleporting" then
+			bypassToggleBtn.Text = "🚀 ĐANG DỊCH CHUYỂN ĐẾN ĐÍCH..."
+			bypassToggleBtn.BackgroundColor3 = Color3.fromRGB(0, 120, 200)
+		elseif bypassState == "Running" then
+			bypassToggleBtn.Text = "⚡ ĐANG KIỂM TRA DUY TRÌ (3.0s)"
+			bypassToggleBtn.BackgroundColor3 = Color3.fromRGB(30, 100, 200)
+		elseif bypassState == "Ragdolling" then
+			bypassToggleBtn.Text = "💫 ĐANG RAGDOLL TỰ NHIÊN..."
+			bypassToggleBtn.BackgroundColor3 = Color3.fromRGB(200, 110, 0)
+		elseif bypassState == "Resetting" then
+			bypassToggleBtn.Text = "💥 ĐANG RESET NHÂN VẬT..."
+			bypassToggleBtn.BackgroundColor3 = Color3.fromRGB(180, 40, 40)
+		elseif bypassState == "Waiting" then
+			bypassToggleBtn.Text = "⏳ CHỜ HỒI SINH HOÀN TOÀN..."
+			bypassToggleBtn.BackgroundColor3 = Color3.fromRGB(180, 110, 20)
+		end
+	else
+		if bypassState == "Success" then
+			bypassToggleBtn.Text = "✔ THÀNH CÔNG! BẤM ĐỂ CHẠY LẠI"
+			bypassToggleBtn.BackgroundColor3 = Color3.fromRGB(0, 150, 80)
+		elseif bypassState == "Cancelled" then
+			bypassToggleBtn.Text = "▶ BẮT ĐẦU LẠI"
+			bypassToggleBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 52)
+		else
+			bypassToggleBtn.Text = "▶ BẮT ĐẦU BYPASS TELEPORT"
+			bypassToggleBtn.BackgroundColor3 = Color3.fromRGB(0, 140, 70)
+		end
+	end
+end
+
+-- Chờ nhân vật cũ phân rã và nhân vật mới sinh ra hoàn chỉnh với Health > 0
+local function waitForCharacterReady(curToken, oldChar)
+	-- Nếu đang từ một nhân vật bị reset/chết, đợi nhân vật cũ bị thay thế hoặc hủy
+	if oldChar then
+		local startWait = tick()
+		while bypassActive and bypassToken == curToken do
+			local curChar = lp.Character
+			if curChar and curChar ~= oldChar then
+				break
+			end
+			if not oldChar.Parent then
+				break
+			end
+			if tick() - startWait > 8 then
+				break
+			end
+			task.wait(0.2)
+		end
+	end
+
+	-- Chờ nhân vật mới sinh ra, Humanoid và RootPart sẵn sàng hoạt động
+	while bypassActive and bypassToken == curToken do
+		local char = lp.Character
+		if char and char ~= oldChar and char.Parent then
+			local hum = char:FindFirstChildOfClass("Humanoid")
+			local root = char:FindFirstChild("HumanoidRootPart")
+			if hum and root and hum.Health > 0 and hum:GetState() ~= Enum.HumanoidStateType.Dead then
+				-- Đợi ổn định vật lý/CFrame sau khi xuất hiện
+				task.wait(0.6)
+				if bypassActive and bypassToken == curToken and hum.Health > 0 then
+					return char, hum, root
+				end
+			end
+		end
+		task.wait(0.2)
+	end
+	return nil, nil, nil
+end
+
+local function cancelBypassTeleport()
+	-- Hủy bỏ ngay lập tức bằng cách tăng Token để mọi luồng cũ lập tức kết thúc
+	bypassToken = bypassToken + 1
+	bypassActive = false
+	bypassState = "Cancelled"
+	bypassTimer = 0
+
+	-- Dọn dẹp ragdoll và mở lại điều khiển, chiêu thức
+	cleanRagdoll()
+	unlockCombatActions()
+
+	local char = lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if hum and hum.Health > 0 then
+		pcall(function()
+			hum.PlatformStand = false
+			hum.AutoRotate = true
+			hum.WalkSpeed = 16
+			hum.JumpPower = 50
+			hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+		end)
+	end
+
+	updateBypassUI()
+	showNotice("Đã hủy bỏ quy trình Bypass Teleport!", Color3.fromRGB(255, 120, 120), 3)
+end
+
+local function startBypassTeleport()
+	local root = getRoot()
+	local char = lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not root or not hum or hum.Health <= 0 then
+		showNotice("Nhân vật chưa sẵn sàng!", Color3.fromRGB(255, 120, 120), 3)
+		return
+	end
+
+	-- Tạo Session Token mới cho lần chạy này
+	bypassToken = bypassToken + 1
+	local curToken = bypassToken
+
+	-- Sử dụng đúng tọa độ cố định theo yêu cầu bắt buộc: X = 1221.7, Y = 209.7, Z = 863.8
+	bypassTargetPos = BYPASS_FIXED_POS
+	bypassTimer = 0
+	bypassActive = true
+
+	showNotice("Bắt đầu Bypass Teleport (Đích cố định: 1221.7, 209.7, 863.8)", Color3.fromRGB(70, 150, 255), 3)
+
+	-- =====================================================================
+	-- MÁY TRẠNG THÁI TUẦN TỰ: TELEPORT -> CHECKING -> RAGDOLL -> RESET -> WAITING -> RETRY
+	-- =====================================================================
+	task.spawn(function()
+		while bypassActive and bypassToken == curToken do
+			-- BƯỚC 1 – DỊCH CHUYỂN ĐẾN TỌA ĐỘ CỐ ĐỊNH
+			bypassState = "Teleporting"
+			updateBypassUI()
+
+			local curChar, curHum, curRoot = waitForCharacterReady(curToken, nil)
+			if not curChar or bypassToken ~= curToken or not bypassActive then return end
+
+			-- Mở khóa điều khiển cho nhân vật mới
+			unlockCombatActions()
+			cleanRagdoll()
+
+			-- Hướng nhìn phẳng tại điểm đích
+			local curLook = curRoot.CFrame.LookVector
+			local curFlatLook = Vector3.new(curLook.X, 0, curLook.Z)
+			if curFlatLook.Magnitude < 0.1 then curFlatLook = Vector3.new(0, 0, -1) end
+			curFlatLook = curFlatLook.Unit
+
+			-- Thực hiện 1 lần dịch chuyển duy nhất đến đúng tọa độ đích cố định
+			curRoot.CFrame = CFrame.new(BYPASS_FIXED_POS, BYPASS_FIXED_POS + curFlatLook)
+			curRoot.AssemblyLinearVelocity = Vector3.zero
+			curRoot.AssemblyAngularVelocity = Vector3.zero
+
+			-- Kiểm tra nhân vật đã đến vị trí đích hợp lệ hay chưa trước khi bắt đầu bộ đếm 3 giây
+			local arrived = false
+			local startCheck = os.clock()
+			while bypassActive and bypassToken == curToken and (os.clock() - startCheck) < 2.0 do
+				local r = getRoot()
+				if r and (r.Position - BYPASS_FIXED_POS).Magnitude <= BYPASS_TOLERANCE then
+					arrived = true
+					break
+				end
+				task.wait(0.05)
+			end
+
+			local success = false
+			local interrupted = false
+
+			if not arrived then
+				-- Chưa tới được vị trí đích hợp lệ, coi như thất bại và kích hoạt reset
+				interrupted = true
+			else
+				-- BƯỚC 2 – KIỂM TRA VỊ TRÍ & BỘ ĐẾM 3 GIÂY
+				bypassState = "Running"
+				bypassTimer = 0
+				updateBypassUI()
+
+				while bypassActive and bypassToken == curToken and not success and not interrupted do
+					local dt = task.wait(0.05)
+					local cChar = lp.Character
+					local cHum = cChar and cChar:FindFirstChildOfClass("Humanoid")
+					local cRoot = cChar and cChar:FindFirstChild("HumanoidRootPart")
+
+					if not cRoot or not cHum or cHum.Health <= 0 then
+						interrupted = true
+						break
+					end
+
+					local dist = (cRoot.Position - BYPASS_FIXED_POS).Magnitude
+					if dist > BYPASS_TOLERANCE then
+						-- Nhân vật bị kéo khỏi vị trí đích hợp lệ!
+						interrupted = true
+						break
+					else
+						bypassTimer = bypassTimer + dt
+						if bypassTimer >= BYPASS_HOLD_TIME then
+							bypassTimer = BYPASS_HOLD_TIME
+							success = true
+							break
+						end
+						updateBypassUI()
+					end
+				end
+			end
+
+			if not bypassActive or bypassToken ~= curToken then return end
+
+			-- BƯỚC 6 – HOÀN THÀNH (SUCCESS)
+			if success then
+				bypassState = "Success"
+				bypassActive = false
+				unlockCombatActions()
+				updateBypassUI()
+				showNotice("Bypass Teleport: Hoàn thành đủ 3 giây hợp lệ!", Color3.fromRGB(0, 230, 120), 5)
+				return
+			end
+
+			-- BƯỚC 3 – RAGDOLL VẬT LÝ & RESET NHÂN VẬT KHI BỊ KÉO LỆCH / GIÁN ĐOẠN
+			if interrupted then
+				local failedChar = lp.Character
+				local failedHum = failedChar and failedChar:FindFirstChildOfClass("Humanoid")
+				local failedRoot = failedChar and failedChar:FindFirstChild("HumanoidRootPart")
+
+				-- Khóa ngay lập tức mọi chiêu thức, công cụ, phím bấm và animation
+				lockCombatActions()
+
+				-- 1. HIỆU ỨNG RAGDOLL TỰ NHIÊN: Ngã tự nhiên, các khớp chuyển động vật lý, khóa điều khiển & chiêu
+				bypassState = "Ragdolling"
+				bypassTimer = 0
+				updateBypassUI()
+				showNotice("Bị kéo lệch! Ragdoll ngã tự nhiên & khóa toàn bộ chiêu thức...", Color3.fromRGB(255, 140, 0), 2.5)
+
+				applyRagdoll(failedChar, failedHum)
+
+				-- Duy trì thời gian sụp đổ vật lý tự nhiên trong 0.8 giây
+				task.wait(0.8)
+				if not bypassActive or bypassToken ~= curToken then
+					cleanRagdoll()
+					unlockCombatActions()
+					return
+				end
+
+				-- 2. KÍCH HOẠT CHẾT THẬT SỰ & RESET: BreakJoints + ChangeState Dead + Diệt Neck
+				bypassState = "Resetting"
+				updateBypassUI()
+				showNotice("Đang kích hoạt Reset & chờ Server hồi sinh...", Color3.fromRGB(255, 80, 80), 2.5)
+
+				forceCharacterDeath(failedChar, failedHum, failedRoot)
+
+				-- BƯỚC 4 – CHỜ HỒI SINH HOÀN TOÀN TỪ SERVER (VẪN KHÓA CHIÊU KHI 0 HP)
+				bypassState = "Waiting"
+				updateBypassUI()
+
+				-- Chờ nhân vật mới spawn ra hoàn tất với Health > 0
+				local newChar, newHum, newRoot = waitForCharacterReady(curToken, failedChar)
+				cleanRagdoll() -- Dọn dẹp rác khớp cũ
+				unlockCombatActions() -- Mở khóa chiêu thức sau khi nhân vật mới đã hồi sinh thành công
+
+				if not newChar or not bypassActive or bypassToken ~= curToken then return end
+
+				-- BƯỚC 5 – THỬ LẠI (RETRY)
+				showNotice("Nhân vật mới đã hồi sinh hoàn toàn. Bắt đầu thử lại...", Color3.fromRGB(70, 160, 255), 2.5)
+				task.wait(0.5)
+				-- Vòng lặp while tiếp tục quay lại BƯỚC 1: Dịch chuyển 1 lần đến vị trí đích cố định
+			end
+		end
+	end)
+end
+
+bypassToggleBtn.Activated:Connect(function()
+	if bypassActive then
+		cancelBypassTeleport()
+	else
+		startBypassTeleport()
+	end
+end)
+
+bypassCancelBtn.Activated:Connect(cancelBypassTeleport)
+
+-- =========================================================================
+-- 9. CHỨC NĂNG: TOẠ ĐỘ (COORDINATE DISPLAY GUI REALTIME)
+-- =========================================================================
+local coordEnabled = false
+local coordScreenGui = nil
+local coordTextLabel = nil
+local coordRenderConn = nil
+
+local function getPlayerGui()
+	return lp:FindFirstChildOfClass("PlayerGui") or lp:WaitForChild("PlayerGui", 5)
+end
+
+-- Tạo giao diện hiển thị tọa độ trên màn hình theo đúng mã nguồn yêu cầu
+local function initCoordinateHUD()
+	if coordScreenGui and coordScreenGui.Parent then return end
+
+	local pGui = getPlayerGui()
+	coordScreenGui = Instance.new("ScreenGui")
+	coordScreenGui.Name = "CoordinateDisplayGUI"
+	coordScreenGui.ResetOnSpawn = false
+	coordScreenGui.Parent = pGui or game:GetService("CoreGui")
+
+	coordTextLabel = Instance.new("TextLabel")
+	coordTextLabel.Size = UDim2.new(0, 220, 0, 70)
+	coordTextLabel.Position = UDim2.new(0, 10, 0, 10)
+	coordTextLabel.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+	coordTextLabel.BackgroundTransparency = 0.4
+	coordTextLabel.TextColor3 = Color3.fromRGB(0, 255, 0)
+	coordTextLabel.TextSize = 15
+	coordTextLabel.Font = Enum.Font.Code
+	coordTextLabel.TextXAlignment = Enum.TextXAlignment.Left
+	coordTextLabel.TextYAlignment = Enum.TextYAlignment.Center
+	coordTextLabel.Parent = coordScreenGui
+
+	Instance.new("UICorner", coordTextLabel).CornerRadius = UDim.new(0, 6)
+end
+
+local function updateCoordUI()
+	if coordEnabled then
+		coordToggleBtn.Text = "📍 TOẠ ĐỘ: ĐANG BẬT"
+		coordToggleBtn.BackgroundColor3 = Color3.fromRGB(0, 140, 70)
+	else
+		coordToggleBtn.Text = "📍 TOẠ ĐỘ: ĐANG TẮT"
+		coordToggleBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 52)
+	end
+end
+
+-- Chức năng Bật/Tắt Toạ độ
+local function toggleCoordinates()
+	coordEnabled = not coordEnabled
+
+	if coordEnabled then
+		initCoordinateHUD()
+		if coordScreenGui then
+			coordScreenGui.Enabled = true
+		end
+		if coordTextLabel then
+			coordTextLabel.Visible = true
+		end
+
+		-- Kết nối RenderStepped cập nhật tọa độ liên tục mỗi khung hình
+		if not coordRenderConn then
+			coordRenderConn = RunService.RenderStepped:Connect(function()
+				local character = lp.Character
+				if character and character:FindFirstChild("HumanoidRootPart") then
+					local pos = character.HumanoidRootPart.Position
+					local formattedText = string.format("  X: %.1f\n  Y: %.1f\n  Z: %.1f", pos.X, pos.Y, pos.Z)
+					if coordTextLabel then
+						coordTextLabel.Text = formattedText
+					end
+					if coordPreviewLabel then
+						coordPreviewLabel.Text = formattedText
+					end
+				else
+					if coordTextLabel then
+						coordTextLabel.Text = "  Đang tìm nhân vật..."
+					end
+					if coordPreviewLabel then
+						coordPreviewLabel.Text = "  Đang tìm nhân vật..."
+					end
+				end
+			end)
+		end
+		showNotice("Đã BẬT chức năng toạ độ!", Color3.fromRGB(0, 240, 120), 2.5)
+	else
+		-- Khi tắt: ngắt kết nối RenderStepped để tối ưu FPS và ẩn HUD
+		if coordRenderConn then
+			coordRenderConn:Disconnect()
+			coordRenderConn = nil
+		end
+		if coordScreenGui then
+			coordScreenGui.Enabled = false
+		end
+		if coordTextLabel then
+			coordTextLabel.Visible = false
+		end
+		if coordPreviewLabel then
+			coordPreviewLabel.Text = "  Chức năng toạ độ đang tắt."
+		end
+		showNotice("Đã TẮT chức năng toạ độ!", Color3.fromRGB(255, 120, 120), 2.5)
+	end
+
+	updateCoordUI()
+end
+
+coordToggleBtn.Activated:Connect(toggleCoordinates)
+
+-- =========================================================================
+-- KHỞI CHẠY TRẠNG THÁI BAN ĐẦU
+-- =========================================================================
+setUI()
+updateLockVisual()
+applyFilter()
+refreshRows()
+updateBypassUI()
+updateCoordUI()
