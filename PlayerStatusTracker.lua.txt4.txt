@@ -1,0 +1,2958 @@
+--[[
+	============================================================================
+	PLAYER STATUS TRACKER (Roblox Luau - Mobile & Executor Compatible)
+	============================================================================
+	Mô tả:
+	- Tra cứu thông tin người chơi Roblox bất kỳ qua username (không cần kết bạn).
+	- Kiểm tra UserId, Display Name, trạng thái ONLINE / OFFLINE / UNKNOWN,
+	  và tên Experience đang chơi (nếu Roblox Presence API cung cấp universeId).
+	- Giao diện tối ưu cho màn hình cảm ứng điện thoại (Android & PC),
+	  có nút nổi (Floating Button), nút khóa vị trí (Lock Button) hoạt động độc lập,
+	  kéo bảng bằng thanh tiêu đề, chống tạo UI trùng lặp và tự động cập nhật định kỳ.
+
+	Lưu ý kỹ thuật về Roblox API:
+	- Không sử dụng cookie .ROBLOSECURITY hay thông tin đăng nhập.
+	- Presence API (presence.roblox.com/v1/presence/users) là API công khai nhưng
+	  khi gọi không xác thực (hoặc theo cài đặt riêng tư của người chơi),
+	  Roblox vẫn trả về userPresenceType (0=Offline, 1=Online, 2=InGame, 3=InStudio),
+	  nhưng thường ẩn (null) các trường universeId / placeId / lastLocation.
+	  Khi không có đủ dữ liệu universeId, script hiển thị trung thực "Không xác định được".
+	============================================================================
+]]
+
+--==============================================================================
+-- 1. KHỞI TẠO SERVICES & DỌN DẸP PHIÊN BẢN CŨ (CHỐNG TRÙNG LẶP)
+--==============================================================================
+local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+local UserInputService = game:GetService("UserInputService")
+local TeleportService = game:GetService("TeleportService")
+local CoreGui = game:GetService("CoreGui")
+
+local CONFIG = {
+	APP_NAME = "Player Status Tracker",
+	GUI_NAME = "PlayerStatusTracker_UI",
+	CLEANUP_KEY = "__PlayerStatusTrackerCleanup_v1",
+	PIN_ENV_KEY = "__PlayerStatusTrackerPinned_v1",
+	PIN_STORAGE_FILE = "pst_pinned_friends.json",
+	MANUAL_COOLDOWN = 2.5,       -- Thời gian chờ tối thiểu giữa các lần bấm CHECK (giây)
+	FRIENDS_REFRESH_COOLDOWN = 3, -- Thời gian chờ tối thiểu giữa các lần bấm REFRESH FRIENDS (giây)
+	AUTO_REFRESH_INTERVAL = 15,  -- Chu kỳ tự động cập nhật liên tục (giây)
+	FRIENDS_AUTO_INTERVAL = 30,  -- Chu kỳ tự động làm mới tab FRIENDS khi đang mở (giây)
+	RATE_LIMIT_BACKOFF = 30,     -- Thời gian chờ khi gặp HTTP 429 (giây)
+	REQUEST_TIMEOUT = 12,        -- Thời gian chờ tối đa mỗi HTTP request (giây)
+	DRAG_THRESHOLD = 8,          -- Ngưỡng pixel phân biệt chạm (tap) và kéo (drag) trên cảm ứng
+	FLOATING_BTN_SIZE = 52,      -- Kích thước nút nổi (50-55 px)
+	LOCK_BTN_SIZE = 34,          -- Kích thước nút ổ khóa bên cạnh
+	SCREEN_MARGIN = 8,           -- Lề an toàn không cho UI vượt khỏi màn hình
+}
+
+local COLORS = {
+	BG_MAIN = Color3.fromRGB(15, 23, 42),
+	BG_PANEL = Color3.fromRGB(22, 33, 54),
+	BG_INPUT = Color3.fromRGB(30, 41, 59),
+	BG_CARD = Color3.fromRGB(18, 27, 46),
+	BORDER = Color3.fromRGB(51, 65, 85),
+	ACCENT = Color3.fromRGB(56, 189, 248),
+	ACCENT_DARK = Color3.fromRGB(14, 116, 144),
+	TEXT_PRIMARY = Color3.fromRGB(241, 245, 249),
+	TEXT_SECONDARY = Color3.fromRGB(148, 163, 184),
+	TEXT_MUTED = Color3.fromRGB(100, 116, 139),
+	ONLINE = Color3.fromRGB(34, 197, 94),
+	OFFLINE = Color3.fromRGB(239, 68, 68),
+	UNKNOWN = Color3.fromRGB(245, 158, 11),
+	PINNED = Color3.fromRGB(250, 204, 21),
+	LOCKED = Color3.fromRGB(245, 158, 11),
+	UNLOCKED = Color3.fromRGB(56, 189, 248),
+	CLOSE_RED = Color3.fromRGB(220, 38, 38),
+}
+
+local function getGlobalEnv()
+	if type(getgenv) == "function" then
+		local ok, env = pcall(getgenv)
+		if ok and type(env) == "table" then
+			return env
+		end
+	end
+	return _G
+end
+
+local function getPreferredGuiParent()
+	if type(gethui) == "function" then
+		local ok, hiddenUi = pcall(gethui)
+		if ok and typeof(hiddenUi) == "Instance" then
+			return hiddenUi
+		end
+	end
+
+	local okCore, coreAvailable = pcall(function()
+		return CoreGui and CoreGui.Name
+	end)
+	if okCore and coreAvailable then
+		return CoreGui
+	end
+
+	local localPlayer = Players.LocalPlayer
+	if localPlayer then
+		return localPlayer:WaitForChild("PlayerGui")
+	end
+	return nil
+end
+
+local function removeExistingGuis()
+	local containers = {}
+	if type(gethui) == "function" then
+		local ok, hiddenUi = pcall(gethui)
+		if ok and typeof(hiddenUi) == "Instance" then
+			table.insert(containers, hiddenUi)
+		end
+	end
+	pcall(function()
+		if CoreGui then
+			table.insert(containers, CoreGui)
+		end
+	end)
+	local lp = Players.LocalPlayer
+	if lp then
+		local pg = lp:FindFirstChildOfClass("PlayerGui")
+		if pg then
+			table.insert(containers, pg)
+		end
+	end
+
+	for _, container in ipairs(containers) do
+		for _, child in ipairs(container:GetChildren()) do
+			if child:IsA("ScreenGui") and child.Name == CONFIG.GUI_NAME then
+				pcall(function()
+					child:Destroy()
+				end)
+			end
+		end
+	end
+end
+
+-- Dọn dẹp phiên bản đang chạy trước đó (nếu người dùng chạy lại script)
+local globalEnv = getGlobalEnv()
+if type(globalEnv[CONFIG.CLEANUP_KEY]) == "function" then
+	pcall(globalEnv[CONFIG.CLEANUP_KEY])
+	globalEnv[CONFIG.CLEANUP_KEY] = nil
+end
+removeExistingGuis()
+
+--==============================================================================
+-- 2. QUẢN LÝ TRẠNG THÁI & CONNECTIONS (CHỐNG RÒ RỈ BỘ NHỚ)
+--==============================================================================
+local state = {
+	destroyed = false,
+	isLocked = false,
+	isMenuOpen = true,
+	activeTab = "TRACKER",
+	isChecking = false,
+	autoRefresh = true,
+	activeTargetUsername = "",
+	lastManualCheckTime = 0,
+	nextAutoCheckTime = 0,
+	activeRequestId = 0,
+	currentServerInfo = nil,
+	isTeleporting = false,
+	activeFriendJoinUserId = nil,
+	isRefreshingFriends = false,
+	friendsLoadedOnce = false,
+	lastFriendsRefreshTime = 0,
+	nextFriendsAutoTime = 0,
+	activeFriendsRequestId = 0,
+	friendsList = {},
+	pinnedUserIds = {},
+	placeNameCache = {},
+	friendCardConnections = {},
+	connections = {},
+	screenGui = nil,
+}
+
+local function trackConnection(conn)
+	if conn then
+		table.insert(state.connections, conn)
+	end
+	return conn
+end
+
+local function clearFriendCardConnections()
+	for _, conn in ipairs(state.friendCardConnections) do
+		pcall(function()
+			if conn.Connected then
+				conn:Disconnect()
+			end
+		end)
+	end
+	table.clear(state.friendCardConnections)
+end
+
+local function cleanup()
+	if state.destroyed then
+		return
+	end
+	state.destroyed = true
+
+	clearFriendCardConnections()
+
+	for _, conn in ipairs(state.connections) do
+		pcall(function()
+			if conn.Connected then
+				conn:Disconnect()
+			end
+		end)
+	end
+	table.clear(state.connections)
+
+	if state.screenGui then
+		local guiRef = state.screenGui
+		state.screenGui = nil
+		pcall(function()
+			guiRef:Destroy()
+		end)
+	end
+
+	if globalEnv[CONFIG.CLEANUP_KEY] == cleanup then
+		globalEnv[CONFIG.CLEANUP_KEY] = nil
+	end
+end
+
+globalEnv[CONFIG.CLEANUP_KEY] = cleanup
+
+--==============================================================================
+-- 3. KIỂM TRA HTTP CAPABILITY & GỬI REQUEST AN TOÀN (KHÔNG TREO, KHÔNG GIẢ LẬP)
+--==============================================================================
+local function detectHttpRequest()
+	local candidates = {
+		function() return request end,
+		function() return http_request end,
+		function() return http and http.request end,
+		function() return syn and syn.request end,
+		function() return fluxus and fluxus.request end,
+		function() return krnl and krnl.request end,
+		function() return Delta and Delta.request end,
+	}
+
+	for _, getter in ipairs(candidates) do
+		local ok, fn = pcall(getter)
+		if ok and type(fn) == "function" then
+			return fn
+		end
+	end
+
+	return nil
+end
+
+local function safeJsonEncode(tbl)
+	local ok, encoded = pcall(function()
+		return HttpService:JSONEncode(tbl)
+	end)
+	if ok and type(encoded) == "string" then
+		return true, encoded
+	end
+	return false, nil
+end
+
+local function safeJsonDecode(raw)
+	if type(raw) ~= "string" or raw == "" then
+		return false, nil
+	end
+	local ok, decoded = pcall(function()
+		return HttpService:JSONDecode(raw)
+	end)
+	if ok and type(decoded) == "table" then
+		return true, decoded
+	end
+	return false, nil
+end
+
+local function httpRequestWithTimeout(httpFn, options, timeoutSeconds)
+	if type(httpFn) ~= "function" then
+		return false, nil, "Môi trường hiện tại không hỗ trợ hàm HTTP request (LocalScript chuẩn không thể gọi API ngoài)."
+	end
+
+	local completed = false
+	local callOk = false
+	local response = nil
+
+	local workerThread = task.spawn(function()
+		callOk, response = pcall(httpFn, options)
+		completed = true
+	end)
+
+	local elapsed = 0
+	local limit = timeoutSeconds or CONFIG.REQUEST_TIMEOUT
+	while not completed and elapsed < limit and not state.destroyed do
+		elapsed += task.wait(0.05)
+	end
+
+	if state.destroyed then
+		pcall(task.cancel, workerThread)
+		return false, nil, "Script đã được đóng."
+	end
+
+	if not completed then
+		pcall(task.cancel, workerThread)
+		return false, nil, "Hết thời gian chờ phản hồi từ API (Timeout " .. tostring(limit) .. "s)."
+	end
+
+	if not callOk then
+		return false, nil, "Lỗi khi gọi HTTP request: " .. tostring(response)
+	end
+
+	if type(response) ~= "table" then
+		return false, nil, "Phản hồi HTTP không hợp lệ từ executor."
+	end
+
+	local statusCode = tonumber(response.StatusCode)
+	if not statusCode then
+		statusCode = (response.Success == true) and 200 or 0
+	end
+
+	return true, {
+		StatusCode = statusCode,
+		Body = type(response.Body) == "string" and response.Body or "",
+	}, nil
+end
+
+--==============================================================================
+-- 4. CÁC HÀM TRUY VẤN ROBLOX PUBLIC API
+--==============================================================================
+local function formatCurrentTime()
+	return os.date("%H:%M:%S - %d/%m/%Y")
+end
+
+local function normalizeUsername(rawInput)
+	if type(rawInput) ~= "string" then
+		return ""
+	end
+	return (rawInput:match("^%s*(.-)%s*$") or "")
+end
+
+-- Bước 1: Tra cứu UserId & Display Name từ Username (users.roblox.com/v1/usernames/users)
+local function fetchUserByUsername(httpFn, username)
+	local okEncode, payload = safeJsonEncode({
+		usernames = { username },
+		excludeBannedUsers = false,
+	})
+	if not okEncode then
+		return false, nil, "Không thể mã hóa dữ liệu JSON cho Users API.", false
+	end
+
+	local okHttp, res, netErr = httpRequestWithTimeout(httpFn, {
+		Url = "https://users.roblox.com/v1/usernames/users",
+		Method = "POST",
+		Headers = {
+			["Content-Type"] = "application/json",
+			["Accept"] = "application/json",
+		},
+		Body = payload,
+	}, CONFIG.REQUEST_TIMEOUT)
+
+	if not okHttp then
+		return false, nil, netErr, false
+	end
+
+	if res.StatusCode == 429 then
+		return false, nil, "Bị giới hạn tốc độ truy vấn (HTTP 429) từ Users API.", true
+	end
+	if res.StatusCode < 200 or res.StatusCode >= 300 then
+		return false, nil, "Users API trả về lỗi HTTP " .. tostring(res.StatusCode) .. ".", false
+	end
+
+	local okDecode, decoded = safeJsonDecode(res.Body)
+	if not okDecode or type(decoded.data) ~= "table" then
+		return false, nil, "Lỗi phân tích dữ liệu JSON từ Users API.", false
+	end
+
+	local userData = decoded.data[1]
+	if type(userData) ~= "table" or type(userData.id) ~= "number" then
+		return false, nil, "Không tìm thấy người chơi với username \"" .. username .. "\".", false
+	end
+
+	return true, {
+		id = userData.id,
+		name = type(userData.name) == "string" and userData.name or username,
+		displayName = type(userData.displayName) == "string" and userData.displayName or (type(userData.name) == "string" and userData.name or username),
+	}, nil, false
+end
+
+-- Bước 2: Kiểm tra trạng thái Online/Offline/InGame (presence.roblox.com/v1/presence/users)
+local function fetchUserPresence(httpFn, userId)
+	local okEncode, payload = safeJsonEncode({
+		userIds = { userId },
+	})
+	if not okEncode then
+		return false, nil, "Không thể mã hóa dữ liệu JSON cho Presence API.", false
+	end
+
+	local okHttp, res, netErr = httpRequestWithTimeout(httpFn, {
+		Url = "https://presence.roblox.com/v1/presence/users",
+		Method = "POST",
+		Headers = {
+			["Content-Type"] = "application/json",
+			["Accept"] = "application/json",
+		},
+		Body = payload,
+	}, CONFIG.REQUEST_TIMEOUT)
+
+	if not okHttp then
+		return false, nil, netErr, false
+	end
+
+	if res.StatusCode == 429 then
+		return false, nil, "Bị giới hạn tốc độ truy vấn (HTTP 429) từ Presence API.", true
+	end
+	if res.StatusCode < 200 or res.StatusCode >= 300 then
+		return false, nil, "Presence API trả về lỗi HTTP " .. tostring(res.StatusCode) .. ".", false
+	end
+
+	local okDecode, decoded = safeJsonDecode(res.Body)
+	if not okDecode or type(decoded.userPresences) ~= "table" then
+		return false, nil, "Lỗi phân tích dữ liệu JSON từ Presence API.", false
+	end
+
+	local presence = decoded.userPresences[1]
+	if type(presence) ~= "table" then
+		return false, nil, "Presence API không trả về dữ liệu trạng thái cho UserId này.", false
+	end
+
+	return true, presence, nil, false
+end
+
+-- Bước 3 phụ (nếu có placeId nhưng thiếu universeId): Lấy universeId từ placeId
+local function fetchUniverseIdFromPlace(httpFn, placeId)
+	local url = string.format("https://apis.roblox.com/universes/v1/places/%d/universe", placeId)
+	local okHttp, res, netErr = httpRequestWithTimeout(httpFn, {
+		Url = url,
+		Method = "GET",
+		Headers = {
+			["Accept"] = "application/json",
+		},
+	}, CONFIG.REQUEST_TIMEOUT)
+
+	if not okHttp then
+		return nil, netErr, false
+	end
+	if res.StatusCode == 429 then
+		return nil, "HTTP 429 từ Universes API.", true
+	end
+	if res.StatusCode < 200 or res.StatusCode >= 300 then
+		return nil, "Universes API trả về HTTP " .. tostring(res.StatusCode), false
+	end
+
+	local okDecode, decoded = safeJsonDecode(res.Body)
+	if okDecode and type(decoded.universeId) == "number" and decoded.universeId > 0 then
+		return decoded.universeId, nil, false
+	end
+	return nil, "Không lấy được universeId từ placeId.", false
+end
+
+-- Bước 3 chính: Lấy tên Experience từ universeId (games.roblox.com/v1/games)
+local function fetchGameNameByUniverseId(httpFn, universeId)
+	local url = string.format("https://games.roblox.com/v1/games?universeIds=%d", universeId)
+	local okHttp, res, netErr = httpRequestWithTimeout(httpFn, {
+		Url = url,
+		Method = "GET",
+		Headers = {
+			["Accept"] = "application/json",
+		},
+	}, CONFIG.REQUEST_TIMEOUT)
+
+	if not okHttp then
+		return false, nil, netErr, false
+	end
+	if res.StatusCode == 429 then
+		return false, nil, "Bị giới hạn tốc độ truy vấn (HTTP 429) từ Games API.", true
+	end
+	if res.StatusCode < 200 or res.StatusCode >= 300 then
+		return false, nil, "Games API trả về lỗi HTTP " .. tostring(res.StatusCode) .. ".", false
+	end
+
+	local okDecode, decoded = safeJsonDecode(res.Body)
+	if not okDecode or type(decoded.data) ~= "table" then
+		return false, nil, "Lỗi phân tích dữ liệu JSON từ Games API.", false
+	end
+
+	local gameInfo = decoded.data[1]
+	if type(gameInfo) == "table" and type(gameInfo.name) == "string" and gameInfo.name ~= "" then
+		return true, gameInfo.name, nil, false
+	end
+
+	return false, nil, "Games API không trả về tên experience.", false
+end
+
+-- Tổng hợp toàn bộ quy trình kiểm tra người chơi
+local function resolvePlayerStatus(rawUsername)
+	local timestamp = formatCurrentTime()
+	local username = normalizeUsername(rawUsername)
+
+	if username == "" then
+		return {
+			username = "Chưa nhập",
+			displayName = "Không xác định được",
+			userIdText = "Không xác định được",
+			status = "UNKNOWN",
+			experience = "Không xác định được",
+			lastCheck = timestamp,
+			errorMessage = "Vui lòng nhập username Roblox cần kiểm tra.",
+			rateLimited = false,
+			shouldStopAuto = true,
+		}
+	end
+
+	if username:find("[%c%s]") then
+		return {
+			username = username,
+			displayName = "Không xác định được",
+			userIdText = "Không xác định được",
+			status = "UNKNOWN",
+			experience = "Không xác định được",
+			lastCheck = timestamp,
+			errorMessage = "Username không hợp lệ (không được chứa khoảng trắng hoặc ký tự điều khiển).",
+			rateLimited = false,
+			shouldStopAuto = true,
+		}
+	end
+
+	local httpFn = detectHttpRequest()
+	if not httpFn then
+		return {
+			username = username,
+			displayName = "Không xác định được",
+			userIdText = "Không xác định được",
+			status = "UNKNOWN",
+			experience = "Không xác định được",
+			lastCheck = timestamp,
+			errorMessage = "Môi trường hiện tại không hỗ trợ HTTP request (thiếu request / http_request / syn.request; LocalScript chuẩn của Roblox không thể gọi HTTP API).",
+			rateLimited = false,
+			shouldStopAuto = true,
+		}
+	end
+
+	-- 1. Lookup UserId & DisplayName
+	local okUser, userInfo, userErr, userRateLimited = fetchUserByUsername(httpFn, username)
+	if not okUser or not userInfo then
+		local notFound = type(userErr) == "string" and userErr:find("Không tìm thấy người chơi", 1, true) ~= nil
+		return {
+			username = username,
+			displayName = "Không xác định được",
+			userIdText = "Không xác định được",
+			status = "UNKNOWN",
+			experience = "Không xác định được",
+			lastCheck = timestamp,
+			errorMessage = userErr or "Không lấy được dữ liệu người chơi.",
+			rateLimited = userRateLimited,
+			shouldStopAuto = notFound,
+		}
+	end
+
+	local function isValidJobId(val)
+		return type(val) == "string" and val ~= "" and val ~= "00000000-0000-0000-0000-000000000000"
+	end
+
+	-- Kiểm tra nhanh nếu người chơi đang ở cùng server hiện tại với LocalPlayer
+	local sameServerPlayer = Players:GetPlayerByUserId(userInfo.id)
+	if sameServerPlayer and game.PlaceId > 0 and isValidJobId(game.JobId) then
+		local localGameName = nil
+		if game.GameId and game.GameId > 0 then
+			local okLocalGame, fetchedName = fetchGameNameByUniverseId(httpFn, game.GameId)
+			if okLocalGame and fetchedName then
+				localGameName = fetchedName
+			end
+		end
+		return {
+			username = userInfo.name,
+			displayName = userInfo.displayName,
+			userIdText = tostring(userInfo.id),
+			status = "ONLINE",
+			experience = localGameName or ("PlaceId: " .. tostring(game.PlaceId)),
+			serverStatus = game.JobId,
+			serverNotice = nil,
+			showJoinRow = true,
+			canJoinServer = true,
+			serverPlaceId = game.PlaceId,
+			serverJobId = game.JobId,
+			lastCheck = timestamp,
+			errorMessage = nil,
+			rateLimited = false,
+		}
+	end
+
+	-- 2. Lookup Presence
+	local okPresence, presence, presErr, presRateLimited = fetchUserPresence(httpFn, userInfo.id)
+	if not okPresence or not presence then
+		return {
+			username = userInfo.name,
+			displayName = userInfo.displayName,
+			userIdText = tostring(userInfo.id),
+			status = "UNKNOWN",
+			experience = "Not Available",
+			serverStatus = nil,
+			serverNotice = nil,
+			showJoinRow = false,
+			canJoinServer = false,
+			serverPlaceId = nil,
+			serverJobId = nil,
+			lastCheck = timestamp,
+			errorMessage = presErr or "Không lấy được dữ liệu trạng thái từ Presence API.",
+			rateLimited = presRateLimited,
+		}
+	end
+
+	local presenceType = tonumber(presence.userPresenceType)
+	local universeId = (type(presence.universeId) == "number" and presence.universeId > 0) and presence.universeId or nil
+	local placeId = (type(presence.placeId) == "number" and presence.placeId > 0) and presence.placeId or nil
+	local rootPlaceId = (type(presence.rootPlaceId) == "number" and presence.rootPlaceId > 0) and presence.rootPlaceId or nil
+	local joinPlaceId = placeId or rootPlaceId
+	local jobId = isValidJobId(presence.gameId) and presence.gameId or nil
+	local rawLocation = (type(presence.lastLocation) == "string" and presence.lastLocation ~= "") and presence.lastLocation or nil
+
+	if presenceType == 0 or presenceType == 4 then
+		return {
+			username = userInfo.name,
+			displayName = userInfo.displayName,
+			userIdText = tostring(userInfo.id),
+			status = "OFFLINE",
+			experience = "Not Available",
+			serverStatus = nil,
+			serverNotice = (presenceType == 4) and "Người chơi đang bật ẩn trạng thái." or nil,
+			showJoinRow = false,
+			canJoinServer = false,
+			serverPlaceId = nil,
+			serverJobId = nil,
+			lastCheck = timestamp,
+			errorMessage = nil,
+			rateLimited = false,
+		}
+	elseif presenceType == 1 then
+		return {
+			username = userInfo.name,
+			displayName = userInfo.displayName,
+			userIdText = tostring(userInfo.id),
+			status = "ONLINE",
+			experience = "Not Playing",
+			serverStatus = nil,
+			serverNotice = nil,
+			showJoinRow = false,
+			canJoinServer = false,
+			serverPlaceId = nil,
+			serverJobId = nil,
+			lastCheck = timestamp,
+			errorMessage = nil,
+			rateLimited = false,
+		}
+	elseif presenceType == 2 or presenceType == 3 then
+		local inStudio = (presenceType == 3)
+
+		-- Thử suy ra universeId từ placeId / rootPlaceId nếu Presence API chỉ trả về placeId
+		if not universeId and joinPlaceId then
+			local resolvedUniverseId, _, uniRateLimited = fetchUniverseIdFromPlace(httpFn, joinPlaceId)
+			if resolvedUniverseId then
+				universeId = resolvedUniverseId
+			elseif uniRateLimited then
+				return {
+					username = userInfo.name,
+					displayName = userInfo.displayName,
+					userIdText = tostring(userInfo.id),
+					status = "ONLINE",
+					experience = "Không xác định được",
+					serverStatus = "Unable to determine",
+					serverNotice = "Không thể xác định server hiện tại của người chơi.",
+					showJoinRow = true,
+					canJoinServer = false,
+					serverPlaceId = nil,
+					serverJobId = nil,
+					lastCheck = timestamp,
+					errorMessage = "Bị giới hạn tốc độ truy vấn (HTTP 429) khi tra cứu universeId.",
+					rateLimited = true,
+				}
+			end
+		end
+
+		local resolvedExpName = nil
+		local gameFetchErr = nil
+		local gameRateLimited = false
+
+		if universeId then
+			local okGame, gameName, gErr, gRateLimited = fetchGameNameByUniverseId(httpFn, universeId)
+			if okGame and gameName then
+				resolvedExpName = inStudio and (gameName .. " (Roblox Studio)") or gameName
+			else
+				gameFetchErr = gErr
+				gameRateLimited = gRateLimited
+			end
+		elseif rawLocation and rawLocation ~= "Website" and rawLocation ~= "Playing" and rawLocation ~= "Game" then
+			resolvedExpName = inStudio and (rawLocation .. " (Roblox Studio)") or rawLocation
+		end
+
+		local canJoin = (not inStudio) and (joinPlaceId ~= nil) and (jobId ~= nil)
+		local expText = resolvedExpName
+		if not expText then
+			expText = inStudio
+				and "Đang trong Roblox Studio (API ẩn universeId)"
+				or "Không xác định được (Roblox API ẩn universeId khi không xác thực .ROBLOSECURITY hoặc theo quyền riêng tư)"
+		end
+
+		local serverText = canJoin and jobId or "Unable to determine"
+		local noticeText = nil
+		if not canJoin then
+			if inStudio then
+				noticeText = "Không thể tham gia server vì người chơi đang mở Roblox Studio."
+			else
+				noticeText = "Không thể xác định server hiện tại của người chơi."
+			end
+		end
+
+		return {
+			username = userInfo.name,
+			displayName = userInfo.displayName,
+			userIdText = tostring(userInfo.id),
+			status = "ONLINE",
+			experience = expText,
+			serverStatus = serverText,
+			serverNotice = noticeText,
+			showJoinRow = true,
+			canJoinServer = canJoin,
+			serverPlaceId = canJoin and joinPlaceId or nil,
+			serverJobId = canJoin and jobId or nil,
+			lastCheck = timestamp,
+			errorMessage = gameFetchErr,
+			rateLimited = gameRateLimited,
+		}
+	else
+		return {
+			username = userInfo.name,
+			displayName = userInfo.displayName,
+			userIdText = tostring(userInfo.id),
+			status = "UNKNOWN",
+			experience = "Not Available",
+			serverStatus = nil,
+			serverNotice = nil,
+			showJoinRow = false,
+			canJoinServer = false,
+			serverPlaceId = nil,
+			serverJobId = nil,
+			lastCheck = timestamp,
+			errorMessage = "Presence API trả về mã trạng thái không xác định (" .. tostring(presence.userPresenceType) .. ").",
+			rateLimited = false,
+		}
+	end
+end
+
+--==============================================================================
+-- 4B. HỆ THỐNG FRIENDS: LƯU GHIM (PIN), LẤY DANH SÁCH BẠN BÈ & SẮP XẾP
+--==============================================================================
+local function isValidServerJobId(val)
+	return type(val) == "string" and val ~= "" and val ~= "00000000-0000-0000-0000-000000000000"
+end
+
+local function loadPinnedFriends()
+	local pinned = {}
+
+	-- Ưu tiên đọc từ bộ nhớ cục bộ của executor (nếu có readfile/isfile, không đụng tới cookie hay token)
+	if type(isfile) == "function" and type(readfile) == "function" then
+		local okExists, exists = pcall(isfile, CONFIG.PIN_STORAGE_FILE)
+		if okExists and exists then
+			local okRead, raw = pcall(readfile, CONFIG.PIN_STORAGE_FILE)
+			if okRead and type(raw) == "string" and raw ~= "" then
+				local okDecode, decoded = safeJsonDecode(raw)
+				if okDecode and type(decoded) == "table" then
+					for _, idVal in ipairs(decoded) do
+						local key = tostring(idVal)
+						if key ~= "" then
+							pinned[key] = true
+						end
+					end
+				end
+			end
+		end
+	end
+
+	-- Kết hợp/dự phòng trong globalEnv trong cùng phiên chạy Roblox
+	if type(globalEnv[CONFIG.PIN_ENV_KEY]) == "table" then
+		for key, flag in pairs(globalEnv[CONFIG.PIN_ENV_KEY]) do
+			if flag == true then
+				pinned[tostring(key)] = true
+			end
+		end
+	end
+
+	state.pinnedUserIds = pinned
+	globalEnv[CONFIG.PIN_ENV_KEY] = pinned
+end
+
+local function savePinnedFriends()
+	local copyMap = {}
+	local serializedList = {}
+	for key, flag in pairs(state.pinnedUserIds) do
+		if flag == true then
+			local strKey = tostring(key)
+			copyMap[strKey] = true
+			table.insert(serializedList, strKey)
+		end
+	end
+	table.sort(serializedList)
+	globalEnv[CONFIG.PIN_ENV_KEY] = copyMap
+
+	if type(writefile) == "function" then
+		local okEncode, encoded = safeJsonEncode(serializedList)
+		if okEncode and encoded then
+			pcall(writefile, CONFIG.PIN_STORAGE_FILE, encoded)
+		end
+	end
+end
+
+local function isFriendPinned(userId)
+	return state.pinnedUserIds[tostring(userId)] == true
+end
+
+local function sortFriendsList(list)
+	table.sort(list, function(a, b)
+		local aPinned = a.isPinned == true
+		local bPinned = b.isPinned == true
+		if aPinned ~= bPinned then
+			return aPinned
+		end
+
+		local function getStatusRank(item)
+			if item.status == "ONLINE" then
+				if item.isInGame then
+					return 1
+				elseif item.inStudio then
+					return 2
+				else
+					return 3
+				end
+			elseif item.status == "OFFLINE" then
+				return 4
+			else
+				return 5
+			end
+		end
+
+		local rankA = getStatusRank(a)
+		local rankB = getStatusRank(b)
+		if rankA ~= rankB then
+			return rankA < rankB
+		end
+
+		local nameA = string.lower(tostring(a.displayName or a.username or ""))
+		local nameB = string.lower(tostring(b.displayName or b.username or ""))
+		if nameA ~= nameB then
+			return nameA < nameB
+		end
+
+		return (tonumber(a.userId) or 0) < (tonumber(b.userId) or 0)
+	end)
+end
+
+-- Lấy danh sách tất cả bạn bè bằng API chính thức Roblox Client (Players:GetFriendsAsync)
+-- và dự phòng qua friends.roblox.com + users.roblox.com nếu GetFriendsAsync lỗi.
+local function fetchAllFriendsBase(localPlayer, httpFn)
+	local friends = {}
+	local seenIds = {}
+
+	local okPages, friendPagesOrErr = pcall(function()
+		return Players:GetFriendsAsync(localPlayer.UserId)
+	end)
+
+	if okPages and friendPagesOrErr then
+		local paginationOk = true
+		while not state.destroyed do
+			local okPage, currentPage = pcall(function()
+				return friendPagesOrErr:GetCurrentPage()
+			end)
+			if not okPage or type(currentPage) ~= "table" then
+				paginationOk = false
+				break
+			end
+
+			for _, entry in ipairs(currentPage) do
+				if type(entry) == "table" and type(entry.Id) == "number" and not seenIds[entry.Id] then
+					seenIds[entry.Id] = true
+					local uname = (type(entry.Username) == "string" and entry.Username ~= "") and entry.Username or ("User_" .. tostring(entry.Id))
+					local dname = (type(entry.DisplayName) == "string" and entry.DisplayName ~= "") and entry.DisplayName or uname
+					table.insert(friends, {
+						userId = entry.Id,
+						username = uname,
+						displayName = dname,
+					})
+				end
+			end
+
+			if friendPagesOrErr.IsFinished then
+				break
+			end
+
+			local okAdv = pcall(function()
+				friendPagesOrErr:AdvanceToNextPageAsync()
+			end)
+			if not okAdv then
+				paginationOk = false
+				break
+			end
+		end
+
+		if paginationOk then
+			return true, friends, nil
+		end
+	end
+
+	-- Dự phòng qua Public Web API nếu GetFriendsAsync gặp sự cố
+	if not httpFn then
+		return false, friends, "Không thể lấy danh sách bạn bè từ Roblox Client API (" .. tostring(friendPagesOrErr) .. ")."
+	end
+
+	local url = string.format("https://friends.roblox.com/v1/users/%d/friends", localPlayer.UserId)
+	local okHttp, res, netErr = httpRequestWithTimeout(httpFn, {
+		Url = url,
+		Method = "GET",
+		Headers = { ["Accept"] = "application/json" },
+	}, CONFIG.REQUEST_TIMEOUT)
+
+	if not okHttp then
+		return false, friends, netErr
+	end
+	if res.StatusCode == 429 then
+		return false, friends, "Bị giới hạn tốc độ (HTTP 429) từ Friends API."
+	end
+	if res.StatusCode < 200 or res.StatusCode >= 300 then
+		return false, friends, "Friends API trả về lỗi HTTP " .. tostring(res.StatusCode) .. "."
+	end
+
+	local okDecode, decoded = safeJsonDecode(res.Body)
+	if not okDecode or type(decoded.data) ~= "table" then
+		return false, friends, "Lỗi phân tích dữ liệu JSON từ Friends API."
+	end
+
+	local fallbackIds = {}
+	local fallbackMap = {}
+	for _, item in ipairs(decoded.data) do
+		if type(item) == "table" and type(item.id) == "number" and not seenIds[item.id] then
+			seenIds[item.id] = true
+			table.insert(fallbackIds, item.id)
+			fallbackMap[item.id] = {
+				userId = item.id,
+				username = (type(item.name) == "string" and item.name ~= "") and item.name or ("User_" .. tostring(item.id)),
+				displayName = (type(item.displayName) == "string" and item.displayName ~= "") and item.displayName or ((type(item.name) == "string" and item.name ~= "") and item.name or ("User_" .. tostring(item.id))),
+			}
+		end
+	end
+
+	-- Bổ sung Username & DisplayName qua users.roblox.com/v1/users theo từng lô tối đa 100 ID
+	for startIdx = 1, #fallbackIds, 100 do
+		if state.destroyed then
+			break
+		end
+		local chunk = {}
+		for i = startIdx, math.min(startIdx + 99, #fallbackIds) do
+			table.insert(chunk, fallbackIds[i])
+		end
+		local okEnc, payload = safeJsonEncode({
+			userIds = chunk,
+			excludeBannedUsers = false,
+		})
+		if okEnc and payload then
+			local okUsers, usersRes = httpRequestWithTimeout(httpFn, {
+				Url = "https://users.roblox.com/v1/users",
+				Method = "POST",
+				Headers = {
+					["Content-Type"] = "application/json",
+					["Accept"] = "application/json",
+				},
+				Body = payload,
+			}, CONFIG.REQUEST_TIMEOUT)
+			if okUsers and usersRes.StatusCode >= 200 and usersRes.StatusCode < 300 then
+				local okUDec, uDecoded = safeJsonDecode(usersRes.Body)
+				if okUDec and type(uDecoded.data) == "table" then
+					for _, uItem in ipairs(uDecoded.data) do
+						if type(uItem) == "table" and type(uItem.id) == "number" and fallbackMap[uItem.id] then
+							local uName = (type(uItem.name) == "string" and uItem.name ~= "") and uItem.name or fallbackMap[uItem.id].username
+							local dName = (type(uItem.displayName) == "string" and uItem.displayName ~= "") and uItem.displayName or uName
+							fallbackMap[uItem.id].username = uName
+							fallbackMap[uItem.id].displayName = dName
+						end
+					end
+				end
+			end
+		end
+	end
+
+	for _, id in ipairs(fallbackIds) do
+		table.insert(friends, fallbackMap[id])
+	end
+
+	return true, friends, nil
+end
+
+-- Lấy danh sách bạn bè đang Online kèm PlaceId / GameId (JobId) / LastLocation
+-- từ chính phiên Roblox của LocalPlayer (không cần cookie .ROBLOSECURITY).
+local function fetchOnlineFriendsMap(localPlayer)
+	local onlineEntries = nil
+	local okOnline = false
+
+	local okAsync, resAsync = pcall(function()
+		return localPlayer:GetFriendsOnlineAsync(200)
+	end)
+	if okAsync and type(resAsync) == "table" then
+		okOnline = true
+		onlineEntries = resAsync
+	end
+
+	if not okOnline then
+		local okCall, res = pcall(function()
+			return localPlayer:GetFriendsOnline(200)
+		end)
+		if okCall and type(res) == "table" then
+			okOnline = true
+			onlineEntries = res
+		end
+	end
+
+	if not okOnline or type(onlineEntries) ~= "table" then
+		return false, {}, 0
+	end
+
+	local map = {}
+	local count = 0
+	for _, entry in ipairs(onlineEntries) do
+		if type(entry) == "table" and type(entry.VisitorId) == "number" then
+			map[entry.VisitorId] = entry
+			count += 1
+		end
+	end
+
+	return true, map, count
+end
+
+local function fetchPresenceBatchMap(httpFn, userIds)
+	local presenceMap = {}
+	if not httpFn or #userIds == 0 then
+		return false, presenceMap
+	end
+
+	local anySuccess = false
+	for startIdx = 1, #userIds, 50 do
+		if state.destroyed then
+			break
+		end
+		local chunk = {}
+		for i = startIdx, math.min(startIdx + 49, #userIds) do
+			table.insert(chunk, userIds[i])
+		end
+
+		local okEnc, payload = safeJsonEncode({ userIds = chunk })
+		if okEnc and payload then
+			local okHttp, res = httpRequestWithTimeout(httpFn, {
+				Url = "https://presence.roblox.com/v1/presence/users",
+				Method = "POST",
+				Headers = {
+					["Content-Type"] = "application/json",
+					["Accept"] = "application/json",
+				},
+				Body = payload,
+			}, CONFIG.REQUEST_TIMEOUT)
+
+			if okHttp and res.StatusCode >= 200 and res.StatusCode < 300 then
+				local okDec, decoded = safeJsonDecode(res.Body)
+				if okDec and type(decoded.userPresences) == "table" then
+					anySuccess = true
+					for _, p in ipairs(decoded.userPresences) do
+						if type(p) == "table" and type(p.userId) == "number" then
+							presenceMap[p.userId] = p
+						end
+					end
+				end
+			end
+		end
+	end
+
+	return anySuccess, presenceMap
+end
+
+local function resolveExperienceNameCached(httpFn, placeId, rawLocation)
+	if type(rawLocation) == "string" and rawLocation ~= "" and rawLocation ~= "Website" and rawLocation ~= "Playing" and rawLocation ~= "Game" then
+		return rawLocation
+	end
+
+	if type(placeId) == "number" and placeId > 0 then
+		if state.placeNameCache[placeId] then
+			return state.placeNameCache[placeId]
+		end
+		if httpFn then
+			local universeId = fetchUniverseIdFromPlace(httpFn, placeId)
+			if universeId then
+				local okGame, gameName = fetchGameNameByUniverseId(httpFn, universeId)
+				if okGame and gameName and gameName ~= "" then
+					state.placeNameCache[placeId] = gameName
+					return gameName
+				end
+			end
+		end
+	end
+
+	return nil
+end
+
+local function resolveFriendsList()
+	local timestamp = formatCurrentTime()
+	local localPlayer = Players.LocalPlayer
+	if not localPlayer then
+		return false, {}, "Không tìm thấy LocalPlayer.", timestamp
+	end
+
+	local httpFn = detectHttpRequest()
+	local okBase, baseFriends, baseErr = fetchAllFriendsBase(localPlayer, httpFn)
+	if not okBase then
+		return false, {}, baseErr or "Không thể lấy danh sách bạn bè.", timestamp
+	end
+
+	local okOnline, onlineMap, onlineTotal = fetchOnlineFriendsMap(localPlayer)
+
+	-- Nếu GetFriendsOnline lỗi (hoặc chạm ngưỡng 200 bạn online), dùng Presence API cho các bạn chưa có dữ liệu online
+	local presenceFallbackMap = {}
+	local hasPresenceFallback = false
+	if (not okOnline or onlineTotal >= 200) and httpFn and #baseFriends > 0 then
+		local missingIds = {}
+		for _, friend in ipairs(baseFriends) do
+			if not onlineMap[friend.userId] then
+				table.insert(missingIds, friend.userId)
+			end
+		end
+		if #missingIds > 0 then
+			hasPresenceFallback, presenceFallbackMap = fetchPresenceBatchMap(httpFn, missingIds)
+		end
+	end
+
+	local normalized = {}
+	for _, friend in ipairs(baseFriends) do
+		if state.destroyed then
+			break
+		end
+
+		local uid = friend.userId
+		local uname = friend.username
+		local dname = friend.displayName
+		local status = "UNKNOWN"
+		local isInGame = false
+		local inStudio = false
+		local experienceText = "UNKNOWN"
+		local placeId = nil
+		local jobId = nil
+		local canJoin = false
+
+		-- Kiểm tra nhanh nếu người bạn đang ở cùng server hiện tại với LocalPlayer
+		local sameServer = Players:GetPlayerByUserId(uid)
+		local onlineInfo = onlineMap[uid]
+
+		if sameServer then
+			status = "ONLINE"
+			isInGame = true
+			if sameServer.Name and sameServer.Name ~= "" then
+				uname = sameServer.Name
+			end
+			if sameServer.DisplayName and sameServer.DisplayName ~= "" then
+				dname = sameServer.DisplayName
+			end
+			placeId = (game.PlaceId and game.PlaceId > 0) and game.PlaceId or nil
+			jobId = isValidServerJobId(game.JobId) and game.JobId or nil
+
+			local gameName = nil
+			if placeId and state.placeNameCache[placeId] then
+				gameName = state.placeNameCache[placeId]
+			elseif onlineInfo then
+				gameName = resolveExperienceNameCached(httpFn, placeId, onlineInfo.LastLocation)
+			elseif game.GameId and game.GameId > 0 and httpFn then
+				local okG, fetched = fetchGameNameByUniverseId(httpFn, game.GameId)
+				if okG and fetched then
+					gameName = fetched
+					if placeId then
+						state.placeNameCache[placeId] = fetched
+					end
+				end
+			end
+
+			if gameName then
+				experienceText = "Playing: " .. gameName
+			elseif placeId then
+				experienceText = "Playing: PlaceId " .. tostring(placeId)
+			else
+				experienceText = "Playing: UNKNOWN"
+			end
+			canJoin = (placeId ~= nil and placeId > 0)
+		elseif onlineInfo then
+			if type(onlineInfo.UserName) == "string" and onlineInfo.UserName ~= "" then
+				uname = onlineInfo.UserName
+			end
+			if type(onlineInfo.DisplayName) == "string" and onlineInfo.DisplayName ~= "" then
+				dname = onlineInfo.DisplayName
+			end
+
+			local locType = tonumber(onlineInfo.LocationType)
+			local rawPlaceId = (type(onlineInfo.PlaceId) == "number" and onlineInfo.PlaceId > 0) and onlineInfo.PlaceId or nil
+			local rawJobId = isValidServerJobId(onlineInfo.GameId) and onlineInfo.GameId or nil
+			local rawLocation = (type(onlineInfo.LastLocation) == "string" and onlineInfo.LastLocation ~= "") and onlineInfo.LastLocation or nil
+
+			-- LocationType của GetFriendsOnline: 1 = MobileInGame, 4 = InGame, 3 = Studio, 6 = TeamCreate
+			if locType == 1 or locType == 4 or (rawPlaceId ~= nil and locType ~= 3 and locType ~= 6) then
+				status = "ONLINE"
+				isInGame = true
+				placeId = rawPlaceId
+				jobId = rawJobId
+				local gameName = resolveExperienceNameCached(httpFn, placeId, rawLocation)
+				if gameName then
+					experienceText = "Playing: " .. gameName
+				elseif placeId then
+					experienceText = "Playing: PlaceId " .. tostring(placeId)
+				else
+					experienceText = "Playing: UNKNOWN"
+				end
+				canJoin = (placeId ~= nil and placeId > 0)
+			elseif locType == 3 or locType == 6 then
+				status = "ONLINE"
+				inStudio = true
+				local studioName = resolveExperienceNameCached(httpFn, rawPlaceId, rawLocation)
+				experienceText = studioName and ("Roblox Studio: " .. studioName) or "Roblox Studio"
+			elseif onlineInfo.IsOnline == false then
+				status = "OFFLINE"
+				experienceText = "Offline"
+			else
+				status = "ONLINE"
+				experienceText = "Not Playing"
+			end
+		elseif okOnline and onlineTotal < 200 then
+			status = "OFFLINE"
+			experienceText = "Offline"
+		elseif hasPresenceFallback and presenceFallbackMap[uid] then
+			local p = presenceFallbackMap[uid]
+			local pType = tonumber(p.userPresenceType)
+			local pPlaceId = (type(p.placeId) == "number" and p.placeId > 0) and p.placeId or ((type(p.rootPlaceId) == "number" and p.rootPlaceId > 0) and p.rootPlaceId or nil)
+			local pJobId = isValidServerJobId(p.gameId) and p.gameId or nil
+			if pType == 0 or pType == 4 then
+				status = "OFFLINE"
+				experienceText = "Offline"
+			elseif pType == 1 then
+				status = "ONLINE"
+				experienceText = "Not Playing"
+			elseif pType == 2 then
+				status = "ONLINE"
+				isInGame = true
+				placeId = pPlaceId
+				jobId = pJobId
+				local gName = resolveExperienceNameCached(httpFn, placeId, p.lastLocation)
+				experienceText = gName and ("Playing: " .. gName) or "Playing: UNKNOWN"
+				canJoin = (placeId ~= nil and placeId > 0)
+			elseif pType == 3 then
+				status = "ONLINE"
+				inStudio = true
+				experienceText = "Roblox Studio"
+			else
+				status = "UNKNOWN"
+				experienceText = "UNKNOWN"
+			end
+		else
+			status = "UNKNOWN"
+			experienceText = "UNKNOWN"
+		end
+
+		table.insert(normalized, {
+			userId = uid,
+			username = uname,
+			displayName = dname,
+			status = status,
+			isInGame = isInGame,
+			inStudio = inStudio,
+			experienceText = experienceText,
+			placeId = placeId,
+			jobId = jobId,
+			canJoin = canJoin,
+			isPinned = isFriendPinned(uid),
+		})
+	end
+
+	sortFriendsList(normalized)
+
+	local warnMsg = nil
+	if not okOnline and not hasPresenceFallback and #normalized > 0 then
+		warnMsg = "Không lấy được dữ liệu Online từ Roblox (hiển thị UNKNOWN)."
+	end
+
+	return true, normalized, warnMsg, timestamp
+end
+
+--==============================================================================
+-- 5. TIỆN ÍCH GIAO DIỆN & KÉO THẢ CẢM ỨNG (MOBILE + PC)
+--==============================================================================
+local function getViewportSize()
+	local cam = workspace.CurrentCamera
+	if cam and cam.ViewportSize and cam.ViewportSize.X > 0 and cam.ViewportSize.Y > 0 then
+		return cam.ViewportSize
+	end
+	return Vector2.new(800, 480)
+end
+
+local function clampPositionToScreen(posX, posY, elemWidth, elemHeight, margin)
+	local vp = getViewportSize()
+	local m = margin or CONFIG.SCREEN_MARGIN
+	local maxX = math.max(m, vp.X - elemWidth - m)
+	local maxY = math.max(m, vp.Y - elemHeight - m)
+	return math.clamp(posX, m, maxX), math.clamp(posY, m, maxY)
+end
+
+local function applyCorner(instance, radius)
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = radius
+	corner.Parent = instance
+	return corner
+end
+
+local function applyStroke(instance, color, thickness, transparency)
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = color
+	stroke.Thickness = thickness or 1
+	stroke.Transparency = transparency or 0
+	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	stroke.Parent = instance
+	return stroke
+end
+
+local function applyPadding(instance, top, right, bottom, left)
+	local pad = Instance.new("UIPadding")
+	pad.PaddingTop = UDim.new(0, top)
+	pad.PaddingRight = UDim.new(0, right)
+	pad.PaddingBottom = UDim.new(0, bottom)
+	pad.PaddingLeft = UDim.new(0, left)
+	pad.Parent = instance
+	return pad
+end
+
+--[[
+	Gắn kéo thả hỗ trợ cả Touch (Android) và Mouse (PC).
+	Đặc biệt: Khi `canDrag()` trả về false (đã khóa), thao tác nhấn `onTap()`
+	vẫn luôn hoạt động bình thường và không bao giờ bị chặn.
+]]
+local function bindDragAndTap(handle, targetFrame, options)
+	local activeInput = nil
+	local activeInputType = nil
+	local dragStartMouse = Vector2.zero
+	local dragStartPos = Vector2.zero
+	local movedBeyondThreshold = false
+
+	trackConnection(handle.InputBegan:Connect(function(input)
+		if state.destroyed then
+			return
+		end
+		local inputType = input.UserInputType
+		if inputType ~= Enum.UserInputType.MouseButton1 and inputType ~= Enum.UserInputType.Touch then
+			return
+		end
+		if activeInput ~= nil then
+			return
+		end
+
+		activeInput = input
+		activeInputType = inputType
+		dragStartMouse = Vector2.new(input.Position.X, input.Position.Y)
+		dragStartPos = Vector2.new(targetFrame.AbsolutePosition.X, targetFrame.AbsolutePosition.Y)
+		movedBeyondThreshold = false
+	end))
+
+	trackConnection(UserInputService.InputChanged:Connect(function(input)
+		if state.destroyed or activeInput == nil then
+			return
+		end
+
+		local isMatchingMove = (activeInputType == Enum.UserInputType.Touch and input == activeInput)
+			or (activeInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement)
+
+		if not isMatchingMove then
+			return
+		end
+
+		local allowDrag = true
+		if type(options.canDrag) == "function" then
+			allowDrag = (options.canDrag() == true)
+		end
+		if not allowDrag then
+			-- Đã khóa: giữ nguyên vị trí, không đánh dấu là đã kéo để tap mở menu luôn nhạy
+			return
+		end
+
+		local currentPos = Vector2.new(input.Position.X, input.Position.Y)
+		local delta = currentPos - dragStartMouse
+		if delta.Magnitude >= CONFIG.DRAG_THRESHOLD then
+			movedBeyondThreshold = true
+		end
+
+		if movedBeyondThreshold then
+			-- Kiểm tra lại điều kiện khóa ngay trước khi cập nhật Position (chỉ áp dụng cho phần tử có canDrag = false)
+			local stillCanDrag = true
+			if type(options.canDrag) == "function" then
+				stillCanDrag = (options.canDrag() == true)
+			end
+			if not stillCanDrag then
+				return
+			end
+
+			local targetSize = targetFrame.AbsoluteSize
+			local clampedX, clampedY = clampPositionToScreen(
+				dragStartPos.X + delta.X,
+				dragStartPos.Y + delta.Y,
+				targetSize.X,
+				targetSize.Y,
+				CONFIG.SCREEN_MARGIN
+			)
+			targetFrame.Position = UDim2.fromOffset(clampedX, clampedY)
+		end
+	end))
+
+	trackConnection(UserInputService.InputEnded:Connect(function(input)
+		if state.destroyed or activeInput == nil then
+			return
+		end
+
+		local isMatchingEnd = (activeInputType == Enum.UserInputType.Touch and input == activeInput)
+			or (activeInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseButton1)
+
+		if not isMatchingEnd then
+			return
+		end
+
+		local wasTap = not movedBeyondThreshold
+		activeInput = nil
+		activeInputType = nil
+		movedBeyondThreshold = false
+
+		if wasTap and type(options.onTap) == "function" then
+			options.onTap()
+		end
+	end))
+end
+
+--==============================================================================
+-- 6. XÂY DỰNG GIAO DIỆN MOBILE HIỆN ĐẠI
+--==============================================================================
+local uiRefs = {}
+
+local function buildUI()
+	local guiParent = getPreferredGuiParent()
+	if not guiParent then
+		warn("[Player Status Tracker] Không tìm thấy thư mục gắn giao diện (gethui / CoreGui / PlayerGui).")
+		return false
+	end
+
+	local screenGui = Instance.new("ScreenGui")
+	screenGui.Name = CONFIG.GUI_NAME
+	screenGui.ResetOnSpawn = false
+	screenGui.IgnoreGuiInset = true
+	screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	screenGui.DisplayOrder = 999999
+	screenGui.Parent = guiParent
+	state.screenGui = screenGui
+
+	trackConnection(screenGui.Destroying:Connect(function()
+		cleanup()
+	end))
+
+	local vp = getViewportSize()
+
+	-- --------------------------------------------------------------------------
+	-- A. CỤM NÚT NỔI (FLOATING BUTTON) + NÚT KHÓA (LOCK BUTTON) BÊN CẠNH
+	-- --------------------------------------------------------------------------
+	local floatingTotalWidth = CONFIG.FLOATING_BTN_SIZE + 8 + CONFIG.LOCK_BTN_SIZE
+	local floatingTotalHeight = CONFIG.FLOATING_BTN_SIZE + 2
+	local initFloatX, initFloatY = clampPositionToScreen(16, math.floor(vp.Y * 0.36), floatingTotalWidth, floatingTotalHeight, CONFIG.SCREEN_MARGIN)
+
+	local floatingContainer = Instance.new("Frame")
+	floatingContainer.Name = "FloatingContainer"
+	floatingContainer.Size = UDim2.fromOffset(floatingTotalWidth, floatingTotalHeight)
+	floatingContainer.Position = UDim2.fromOffset(initFloatX, initFloatY)
+	floatingContainer.BackgroundTransparency = 1
+	floatingContainer.ZIndex = 20
+	floatingContainer.Parent = screenGui
+
+	-- Nút nổi hình tròn (~52px)
+	local floatingButton = Instance.new("TextButton")
+	floatingButton.Name = "FloatingToggleButton"
+	floatingButton.Size = UDim2.fromOffset(CONFIG.FLOATING_BTN_SIZE, CONFIG.FLOATING_BTN_SIZE)
+	floatingButton.Position = UDim2.fromOffset(0, 1)
+	floatingButton.BackgroundColor3 = COLORS.BG_MAIN
+	floatingButton.Text = ""
+	floatingButton.AutoButtonColor = false
+	floatingButton.ZIndex = 21
+	floatingButton.Parent = floatingContainer
+	applyCorner(floatingButton, UDim.new(1, 0))
+	local floatStroke = applyStroke(floatingButton, COLORS.ACCENT, 2, 0.1)
+
+	local floatInnerRing = Instance.new("Frame")
+	floatInnerRing.Name = "InnerRing"
+	floatInnerRing.Size = UDim2.fromOffset(38, 38)
+	floatInnerRing.Position = UDim2.fromScale(0.5, 0.5)
+	floatInnerRing.AnchorPoint = Vector2.new(0.5, 0.5)
+	floatInnerRing.BackgroundColor3 = COLORS.BG_PANEL
+	floatInnerRing.ZIndex = 22
+	floatInnerRing.Parent = floatingButton
+	applyCorner(floatInnerRing, UDim.new(1, 0))
+	applyStroke(floatInnerRing, COLORS.ACCENT, 1, 0.55)
+
+	local floatLabel = Instance.new("TextLabel")
+	floatLabel.Name = "BadgeText"
+	floatLabel.Size = UDim2.fromScale(1, 1)
+	floatLabel.BackgroundTransparency = 1
+	floatLabel.Text = "PST"
+	floatLabel.TextColor3 = COLORS.TEXT_PRIMARY
+	floatLabel.Font = Enum.Font.GothamBold
+	floatLabel.TextSize = 13
+	floatLabel.ZIndex = 23
+	floatLabel.Parent = floatInnerRing
+
+	local floatStatusDot = Instance.new("Frame")
+	floatStatusDot.Name = "StatusDot"
+	floatStatusDot.Size = UDim2.fromOffset(10, 10)
+	floatStatusDot.Position = UDim2.new(1, -11, 0, 1)
+	floatStatusDot.BackgroundColor3 = COLORS.ACCENT
+	floatStatusDot.ZIndex = 24
+	floatStatusDot.Parent = floatingButton
+	applyCorner(floatStatusDot, UDim.new(1, 0))
+	applyStroke(floatStatusDot, COLORS.BG_MAIN, 2, 0)
+
+	-- Nút khóa vị trí đặt bên cạnh nút nổi (không che nút nổi)
+	local lockButton = Instance.new("TextButton")
+	lockButton.Name = "LockPositionButton"
+	lockButton.Size = UDim2.fromOffset(CONFIG.LOCK_BTN_SIZE, CONFIG.LOCK_BTN_SIZE)
+	lockButton.Position = UDim2.fromOffset(CONFIG.FLOATING_BTN_SIZE + 8, math.floor((floatingTotalHeight - CONFIG.LOCK_BTN_SIZE) / 2))
+	lockButton.BackgroundColor3 = COLORS.BG_PANEL
+	lockButton.Text = ""
+	lockButton.AutoButtonColor = false
+	lockButton.ZIndex = 21
+	lockButton.Parent = floatingContainer
+	applyCorner(lockButton, UDim.new(0, 10))
+	local lockStroke = applyStroke(lockButton, COLORS.UNLOCKED, 1.5, 0.15)
+
+	-- Vẽ biểu tượng ổ khóa bằng Frame để hiển thị sắc nét trên mọi thiết bị Android
+	local lockIconHolder = Instance.new("Frame")
+	lockIconHolder.Name = "LockIcon"
+	lockIconHolder.Size = UDim2.fromOffset(18, 20)
+	lockIconHolder.Position = UDim2.fromScale(0.5, 0.5)
+	lockIconHolder.AnchorPoint = Vector2.new(0.5, 0.5)
+	lockIconHolder.BackgroundTransparency = 1
+	lockIconHolder.ZIndex = 22
+	lockIconHolder.Parent = lockButton
+
+	local lockShackle = Instance.new("Frame")
+	lockShackle.Name = "Shackle"
+	lockShackle.Size = UDim2.fromOffset(10, 9)
+	lockShackle.Position = UDim2.fromOffset(4, 1)
+	lockShackle.BackgroundTransparency = 1
+	lockShackle.ZIndex = 22
+	lockShackle.Parent = lockIconHolder
+	applyCorner(lockShackle, UDim.new(1, 0))
+	local shackleStroke = applyStroke(lockShackle, COLORS.UNLOCKED, 2, 0)
+
+	local lockBody = Instance.new("Frame")
+	lockBody.Name = "Body"
+	lockBody.Size = UDim2.fromOffset(14, 10)
+	lockBody.Position = UDim2.fromOffset(2, 9)
+	lockBody.BackgroundColor3 = COLORS.UNLOCKED
+	lockBody.ZIndex = 23
+	lockBody.Parent = lockIconHolder
+	applyCorner(lockBody, UDim.new(0, 3))
+
+	local lockKeyhole = Instance.new("Frame")
+	lockKeyhole.Name = "Keyhole"
+	lockKeyhole.Size = UDim2.fromOffset(3, 4)
+	lockKeyhole.Position = UDim2.fromScale(0.5, 0.5)
+	lockKeyhole.AnchorPoint = Vector2.new(0.5, 0.5)
+	lockKeyhole.BackgroundColor3 = COLORS.BG_PANEL
+	lockKeyhole.ZIndex = 24
+	lockKeyhole.Parent = lockBody
+	applyCorner(lockKeyhole, UDim.new(1, 0))
+
+	-- --------------------------------------------------------------------------
+	-- B. GIAO DIỆN CHÍNH (MAIN PANEL - RESPONSIVE CHO ĐIỆN THOẠI)
+	-- --------------------------------------------------------------------------
+	local panelW = math.clamp(vp.X - 24, 260, 380)
+	local panelH = math.clamp(vp.Y - 36, 300, 488)
+	local initPanelX, initPanelY = clampPositionToScreen(
+		math.floor((vp.X - panelW) / 2),
+		math.floor((vp.Y - panelH) / 2),
+		panelW,
+		panelH,
+		CONFIG.SCREEN_MARGIN
+	)
+
+	local mainPanel = Instance.new("Frame")
+	mainPanel.Name = "MainPanel"
+	mainPanel.Size = UDim2.fromOffset(panelW, panelH)
+	mainPanel.Position = UDim2.fromOffset(initPanelX, initPanelY)
+	mainPanel.BackgroundColor3 = COLORS.BG_MAIN
+	mainPanel.Visible = state.isMenuOpen
+	mainPanel.ClipsDescendants = true
+	mainPanel.ZIndex = 10
+	mainPanel.Parent = screenGui
+	applyCorner(mainPanel, UDim.new(0, 14))
+	applyStroke(mainPanel, COLORS.BORDER, 1.5, 0)
+
+	-- Thanh tiêu đề (kéo bảng + nút X đóng)
+	local titleBar = Instance.new("Frame")
+	titleBar.Name = "TitleBar"
+	titleBar.Size = UDim2.new(1, 0, 0, 46)
+	titleBar.BackgroundColor3 = COLORS.BG_PANEL
+	titleBar.ZIndex = 11
+	titleBar.Parent = mainPanel
+
+	local titleDivider = Instance.new("Frame")
+	titleDivider.Size = UDim2.new(1, 0, 0, 1)
+	titleDivider.Position = UDim2.new(0, 0, 1, -1)
+	titleDivider.BackgroundColor3 = COLORS.BORDER
+	titleDivider.BorderSizePixel = 0
+	titleDivider.ZIndex = 12
+	titleDivider.Parent = titleBar
+
+	local titleDot = Instance.new("Frame")
+	titleDot.Size = UDim2.fromOffset(10, 10)
+	titleDot.Position = UDim2.new(0, 14, 0.5, 0)
+	titleDot.AnchorPoint = Vector2.new(0, 0.5)
+	titleDot.BackgroundColor3 = COLORS.ACCENT
+	titleDot.ZIndex = 12
+	titleDot.Parent = titleBar
+	applyCorner(titleDot, UDim.new(1, 0))
+
+	local titleText = Instance.new("TextLabel")
+	titleText.Name = "TitleText"
+	titleText.Size = UDim2.new(1, -76, 1, 0)
+	titleText.Position = UDim2.fromOffset(32, 0)
+	titleText.BackgroundTransparency = 1
+	titleText.Text = "Player Status Tracker"
+	titleText.TextColor3 = COLORS.TEXT_PRIMARY
+	titleText.Font = Enum.Font.GothamBold
+	titleText.TextSize = 15
+	titleText.TextXAlignment = Enum.TextXAlignment.Left
+	titleText.ZIndex = 12
+	titleText.Parent = titleBar
+
+	local closeButton = Instance.new("TextButton")
+	closeButton.Name = "CloseButton"
+	closeButton.Size = UDim2.fromOffset(34, 34)
+	closeButton.Position = UDim2.new(1, -40, 0.5, 0)
+	closeButton.AnchorPoint = Vector2.new(0, 0.5)
+	closeButton.BackgroundColor3 = COLORS.BG_INPUT
+	closeButton.Text = "X"
+	closeButton.TextColor3 = COLORS.TEXT_PRIMARY
+	closeButton.Font = Enum.Font.GothamBold
+	closeButton.TextSize = 15
+	closeButton.AutoButtonColor = false
+	closeButton.ZIndex = 13
+	closeButton.Parent = titleBar
+	applyCorner(closeButton, UDim.new(0, 8))
+	applyStroke(closeButton, COLORS.BORDER, 1, 0.2)
+
+	-- Thân giao diện chính
+	local bodyFrame = Instance.new("Frame")
+	bodyFrame.Name = "BodyFrame"
+	bodyFrame.Size = UDim2.new(1, 0, 1, -46)
+	bodyFrame.Position = UDim2.fromOffset(0, 46)
+	bodyFrame.BackgroundTransparency = 1
+	bodyFrame.ZIndex = 11
+	bodyFrame.Parent = mainPanel
+	applyPadding(bodyFrame, 10, 12, 12, 12)
+
+	-- Thanh chuyển Tab riêng biệt: TRACKER | FRIENDS
+	local tabBar = Instance.new("Frame")
+	tabBar.Name = "TabBar"
+	tabBar.Size = UDim2.new(1, 0, 0, 36)
+	tabBar.Position = UDim2.fromOffset(0, 0)
+	tabBar.BackgroundTransparency = 1
+	tabBar.ZIndex = 12
+	tabBar.Parent = bodyFrame
+
+	local trackerTabButton = Instance.new("TextButton")
+	trackerTabButton.Name = "TrackerTabButton"
+	trackerTabButton.Size = UDim2.new(0.5, -4, 1, 0)
+	trackerTabButton.Position = UDim2.fromScale(0, 0)
+	trackerTabButton.BackgroundColor3 = COLORS.ACCENT
+	trackerTabButton.Text = "TRACKER"
+	trackerTabButton.TextColor3 = COLORS.BG_MAIN
+	trackerTabButton.Font = Enum.Font.GothamBold
+	trackerTabButton.TextSize = 13
+	trackerTabButton.AutoButtonColor = false
+	trackerTabButton.ZIndex = 13
+	trackerTabButton.Parent = tabBar
+	applyCorner(trackerTabButton, UDim.new(0, 9))
+	local trackerTabStroke = applyStroke(trackerTabButton, COLORS.ACCENT, 1.2, 0)
+
+	local friendsTabButton = Instance.new("TextButton")
+	friendsTabButton.Name = "FriendsTabButton"
+	friendsTabButton.Size = UDim2.new(0.5, -4, 1, 0)
+	friendsTabButton.Position = UDim2.new(0.5, 4, 0, 0)
+	friendsTabButton.BackgroundColor3 = COLORS.BG_PANEL
+	friendsTabButton.Text = "FRIENDS"
+	friendsTabButton.TextColor3 = COLORS.TEXT_SECONDARY
+	friendsTabButton.Font = Enum.Font.GothamBold
+	friendsTabButton.TextSize = 13
+	friendsTabButton.AutoButtonColor = false
+	friendsTabButton.ZIndex = 13
+	friendsTabButton.Parent = tabBar
+	applyCorner(friendsTabButton, UDim.new(0, 9))
+	local friendsTabStroke = applyStroke(friendsTabButton, COLORS.BORDER, 1.2, 0.15)
+
+	-- Khu vực 1: PLAYER STATUS TRACKER (giữ nguyên toàn bộ tính năng cũ)
+	local trackerContainer = Instance.new("Frame")
+	trackerContainer.Name = "TrackerContainer"
+	trackerContainer.Size = UDim2.new(1, 0, 1, -44)
+	trackerContainer.Position = UDim2.fromOffset(0, 44)
+	trackerContainer.BackgroundTransparency = 1
+	trackerContainer.Visible = true
+	trackerContainer.ZIndex = 11
+	trackerContainer.Parent = bodyFrame
+
+	-- Ô nhập username
+	local usernameBox = Instance.new("TextBox")
+	usernameBox.Name = "UsernameInput"
+	usernameBox.Size = UDim2.new(1, 0, 0, 44)
+	usernameBox.Position = UDim2.fromOffset(0, 0)
+	usernameBox.BackgroundColor3 = COLORS.BG_INPUT
+	usernameBox.Text = ""
+	usernameBox.PlaceholderText = "Nhập username Roblox..."
+	usernameBox.PlaceholderColor3 = COLORS.TEXT_MUTED
+	usernameBox.TextColor3 = COLORS.TEXT_PRIMARY
+	usernameBox.Font = Enum.Font.GothamMedium
+	usernameBox.TextSize = 15
+	usernameBox.ClearTextOnFocus = false
+	usernameBox.TextXAlignment = Enum.TextXAlignment.Left
+	usernameBox.ZIndex = 12
+	usernameBox.Parent = trackerContainer
+	applyCorner(usernameBox, UDim.new(0, 10))
+	applyStroke(usernameBox, COLORS.BORDER, 1, 0)
+	applyPadding(usernameBox, 0, 12, 0, 12)
+
+	-- Hàng nút điều khiển (CHECK + AUTO)
+	local actionRow = Instance.new("Frame")
+	actionRow.Name = "ActionRow"
+	actionRow.Size = UDim2.new(1, 0, 0, 44)
+	actionRow.Position = UDim2.fromOffset(0, 52)
+	actionRow.BackgroundTransparency = 1
+	actionRow.ZIndex = 12
+	actionRow.Parent = trackerContainer
+
+	local checkButton = Instance.new("TextButton")
+	checkButton.Name = "CheckButton"
+	checkButton.Size = UDim2.new(0.65, -4, 1, 0)
+	checkButton.Position = UDim2.fromScale(0, 0)
+	checkButton.BackgroundColor3 = COLORS.ACCENT
+	checkButton.Text = "CHECK"
+	checkButton.TextColor3 = COLORS.BG_MAIN
+	checkButton.Font = Enum.Font.GothamBold
+	checkButton.TextSize = 15
+	checkButton.AutoButtonColor = false
+	checkButton.ZIndex = 13
+	checkButton.Parent = actionRow
+	applyCorner(checkButton, UDim.new(0, 10))
+
+	local autoButton = Instance.new("TextButton")
+	autoButton.Name = "AutoRefreshButton"
+	autoButton.Size = UDim2.new(0.35, -4, 1, 0)
+	autoButton.Position = UDim2.new(0.65, 4, 0, 0)
+	autoButton.BackgroundColor3 = COLORS.BG_PANEL
+	autoButton.Text = "AUTO: ON"
+	autoButton.TextColor3 = COLORS.ONLINE
+	autoButton.Font = Enum.Font.GothamBold
+	autoButton.TextSize = 12
+	autoButton.AutoButtonColor = false
+	autoButton.ZIndex = 13
+	autoButton.Parent = actionRow
+	applyCorner(autoButton, UDim.new(0, 10))
+	local autoStroke = applyStroke(autoButton, COLORS.ONLINE, 1.2, 0.35)
+
+	-- Thanh trạng thái LOADING / ERROR / AUTO COUNTDOWN
+	local statusBanner = Instance.new("Frame")
+	statusBanner.Name = "StatusBanner"
+	statusBanner.Size = UDim2.new(1, 0, 0, 34)
+	statusBanner.Position = UDim2.fromOffset(0, 104)
+	statusBanner.BackgroundColor3 = COLORS.BG_CARD
+	statusBanner.ZIndex = 12
+	statusBanner.Parent = trackerContainer
+	applyCorner(statusBanner, UDim.new(0, 8))
+	local bannerStroke = applyStroke(statusBanner, COLORS.BORDER, 1, 0.2)
+
+	local bannerText = Instance.new("TextLabel")
+	bannerText.Name = "BannerText"
+	bannerText.Size = UDim2.new(1, -16, 1, 0)
+	bannerText.Position = UDim2.fromOffset(8, 0)
+	bannerText.BackgroundTransparency = 1
+	bannerText.Text = "Sẵn sàng. Nhập username và nhấn CHECK."
+	bannerText.TextColor3 = COLORS.TEXT_SECONDARY
+	bannerText.Font = Enum.Font.GothamMedium
+	bannerText.TextSize = 12
+	bannerText.TextXAlignment = Enum.TextXAlignment.Left
+	bannerText.TextTruncate = Enum.TextTruncate.AtEnd
+	bannerText.ZIndex = 13
+	bannerText.Parent = statusBanner
+
+	-- Khu vực hiển thị kết quả (cuộn mượt trên màn hình điện thoại nhỏ)
+	local resultScroll = Instance.new("ScrollingFrame")
+	resultScroll.Name = "ResultScroll"
+	resultScroll.Size = UDim2.new(1, 0, 1, -146)
+	resultScroll.Position = UDim2.fromOffset(0, 146)
+	resultScroll.BackgroundColor3 = COLORS.BG_CARD
+	resultScroll.BorderSizePixel = 0
+	resultScroll.ScrollBarThickness = 4
+	resultScroll.ScrollBarImageColor3 = COLORS.BORDER
+	resultScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+	resultScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	resultScroll.ScrollingEnabled = true
+	resultScroll.ZIndex = 12
+	resultScroll.Parent = trackerContainer
+	applyCorner(resultScroll, UDim.new(0, 10))
+	applyStroke(resultScroll, COLORS.BORDER, 1, 0.1)
+	applyPadding(resultScroll, 12, 12, 12, 12)
+
+	local resultLayout = Instance.new("UIListLayout")
+	resultLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	resultLayout.Padding = UDim.new(0, 6)
+	resultLayout.Parent = resultScroll
+
+	local function createResultLine(name, text, color, font, size, order)
+		local lbl = Instance.new("TextLabel")
+		lbl.Name = name
+		lbl.Size = UDim2.new(1, 0, 0, 0)
+		lbl.AutomaticSize = Enum.AutomaticSize.Y
+		lbl.BackgroundTransparency = 1
+		lbl.Text = text
+		lbl.TextColor3 = color
+		lbl.Font = font
+		lbl.TextSize = size
+		lbl.TextWrapped = true
+		lbl.TextXAlignment = Enum.TextXAlignment.Left
+		lbl.TextYAlignment = Enum.TextYAlignment.Top
+		lbl.LayoutOrder = order
+		lbl.ZIndex = 13
+		lbl.Parent = resultScroll
+		return lbl
+	end
+
+	createResultLine("HeaderLabel", "PLAYER INFORMATION", COLORS.ACCENT, Enum.Font.GothamBold, 13, 1)
+
+	local dividerLine = Instance.new("Frame")
+	dividerLine.Name = "Divider"
+	dividerLine.Size = UDim2.new(1, 0, 0, 1)
+	dividerLine.BackgroundColor3 = COLORS.BORDER
+	dividerLine.BorderSizePixel = 0
+	dividerLine.LayoutOrder = 2
+	dividerLine.ZIndex = 13
+	dividerLine.Parent = resultScroll
+
+	local usernameLine = createResultLine("UsernameLine", "Username: -", COLORS.TEXT_PRIMARY, Enum.Font.GothamMedium, 13, 3)
+	local displayNameLine = createResultLine("DisplayNameLine", "Display Name: -", COLORS.TEXT_PRIMARY, Enum.Font.GothamMedium, 13, 4)
+	local userIdLine = createResultLine("UserIdLine", "UserId: -", COLORS.TEXT_PRIMARY, Enum.Font.GothamMedium, 13, 5)
+	local statusLine = createResultLine("StatusLine", "STATUS: UNKNOWN", COLORS.UNKNOWN, Enum.Font.GothamBold, 14, 6)
+
+	createResultLine("ExpTitleLine", "CURRENT EXPERIENCE:", COLORS.TEXT_SECONDARY, Enum.Font.GothamBold, 12, 7)
+	local expValueLine = createResultLine("ExpValueLine", "Not Available", COLORS.TEXT_PRIMARY, Enum.Font.GothamMedium, 13, 8)
+
+	local serverTitleLine = createResultLine("ServerTitleLine", "SERVER:", COLORS.TEXT_SECONDARY, Enum.Font.GothamBold, 12, 9)
+	serverTitleLine.Visible = false
+	local serverValueLine = createResultLine("ServerValueLine", "Unable to determine", COLORS.TEXT_PRIMARY, Enum.Font.GothamMedium, 12, 10)
+	serverValueLine.Visible = false
+
+	local joinServerButton = Instance.new("TextButton")
+	joinServerButton.Name = "JoinServerButton"
+	joinServerButton.Size = UDim2.new(1, 0, 0, 38)
+	joinServerButton.BackgroundColor3 = COLORS.BG_INPUT
+	joinServerButton.Text = "JOIN SERVER không khả dụng"
+	joinServerButton.TextColor3 = COLORS.TEXT_SECONDARY
+	joinServerButton.Font = Enum.Font.GothamBold
+	joinServerButton.TextSize = 13
+	joinServerButton.AutoButtonColor = false
+	joinServerButton.Visible = false
+	joinServerButton.LayoutOrder = 11
+	joinServerButton.ZIndex = 13
+	joinServerButton.Parent = resultScroll
+	applyCorner(joinServerButton, UDim.new(0, 8))
+	local joinButtonStroke = applyStroke(joinServerButton, COLORS.BORDER, 1, 0.15)
+
+	local serverNoticeLine = createResultLine("ServerNoticeLine", "", COLORS.UNKNOWN, Enum.Font.GothamMedium, 12, 12)
+	serverNoticeLine.Visible = false
+
+	createResultLine("LastCheckTitleLine", "LAST CHECK:", COLORS.TEXT_SECONDARY, Enum.Font.GothamBold, 12, 13)
+	local lastCheckValueLine = createResultLine("LastCheckValueLine", "-", COLORS.TEXT_PRIMARY, Enum.Font.GothamMedium, 13, 14)
+
+	local errorDetailLine = createResultLine("ErrorDetailLine", "", COLORS.OFFLINE, Enum.Font.GothamMedium, 12, 15)
+	errorDetailLine.Visible = false
+
+	-- Khu vực 2: FRIENDS (menu riêng biệt, tối ưu chạm trên Android)
+	local friendsContainer = Instance.new("Frame")
+	friendsContainer.Name = "FriendsContainer"
+	friendsContainer.Size = UDim2.new(1, 0, 1, -44)
+	friendsContainer.Position = UDim2.fromOffset(0, 44)
+	friendsContainer.BackgroundTransparency = 1
+	friendsContainer.Visible = false
+	friendsContainer.ZIndex = 11
+	friendsContainer.Parent = bodyFrame
+
+	local friendsTopRow = Instance.new("Frame")
+	friendsTopRow.Name = "FriendsTopRow"
+	friendsTopRow.Size = UDim2.new(1, 0, 0, 40)
+	friendsTopRow.Position = UDim2.fromOffset(0, 0)
+	friendsTopRow.BackgroundTransparency = 1
+	friendsTopRow.ZIndex = 12
+	friendsTopRow.Parent = friendsContainer
+
+	local friendsRefreshButton = Instance.new("TextButton")
+	friendsRefreshButton.Name = "FriendsRefreshButton"
+	friendsRefreshButton.Size = UDim2.new(0.42, -4, 1, 0)
+	friendsRefreshButton.Position = UDim2.fromScale(0, 0)
+	friendsRefreshButton.BackgroundColor3 = COLORS.ACCENT
+	friendsRefreshButton.Text = "REFRESH"
+	friendsRefreshButton.TextColor3 = COLORS.BG_MAIN
+	friendsRefreshButton.Font = Enum.Font.GothamBold
+	friendsRefreshButton.TextSize = 13
+	friendsRefreshButton.AutoButtonColor = false
+	friendsRefreshButton.ZIndex = 13
+	friendsRefreshButton.Parent = friendsTopRow
+	applyCorner(friendsRefreshButton, UDim.new(0, 10))
+
+	local friendsSummaryBox = Instance.new("Frame")
+	friendsSummaryBox.Name = "FriendsSummaryBox"
+	friendsSummaryBox.Size = UDim2.new(0.58, -4, 1, 0)
+	friendsSummaryBox.Position = UDim2.new(0.42, 4, 0, 0)
+	friendsSummaryBox.BackgroundColor3 = COLORS.BG_PANEL
+	friendsSummaryBox.ZIndex = 12
+	friendsSummaryBox.Parent = friendsTopRow
+	applyCorner(friendsSummaryBox, UDim.new(0, 10))
+	applyStroke(friendsSummaryBox, COLORS.BORDER, 1, 0.15)
+
+	local friendsSummaryText = Instance.new("TextLabel")
+	friendsSummaryText.Name = "FriendsSummaryText"
+	friendsSummaryText.Size = UDim2.new(1, -14, 1, 0)
+	friendsSummaryText.Position = UDim2.fromOffset(7, 0)
+	friendsSummaryText.BackgroundTransparency = 1
+	friendsSummaryText.Text = "Online: 0 | Total: 0"
+	friendsSummaryText.TextColor3 = COLORS.TEXT_PRIMARY
+	friendsSummaryText.Font = Enum.Font.GothamBold
+	friendsSummaryText.TextSize = 12
+	friendsSummaryText.TextXAlignment = Enum.TextXAlignment.Center
+	friendsSummaryText.TextTruncate = Enum.TextTruncate.AtEnd
+	friendsSummaryText.ZIndex = 13
+	friendsSummaryText.Parent = friendsSummaryBox
+
+	local friendsBanner = Instance.new("Frame")
+	friendsBanner.Name = "FriendsBanner"
+	friendsBanner.Size = UDim2.new(1, 0, 0, 32)
+	friendsBanner.Position = UDim2.fromOffset(0, 46)
+	friendsBanner.BackgroundColor3 = COLORS.BG_CARD
+	friendsBanner.ZIndex = 12
+	friendsBanner.Parent = friendsContainer
+	applyCorner(friendsBanner, UDim.new(0, 8))
+	local friendsBannerStroke = applyStroke(friendsBanner, COLORS.BORDER, 1, 0.2)
+
+	local friendsBannerText = Instance.new("TextLabel")
+	friendsBannerText.Name = "FriendsBannerText"
+	friendsBannerText.Size = UDim2.new(1, -16, 1, 0)
+	friendsBannerText.Position = UDim2.fromOffset(8, 0)
+	friendsBannerText.BackgroundTransparency = 1
+	friendsBannerText.Text = "Mở tab FRIENDS hoặc nhấn REFRESH để tải bạn bè."
+	friendsBannerText.TextColor3 = COLORS.TEXT_SECONDARY
+	friendsBannerText.Font = Enum.Font.GothamMedium
+	friendsBannerText.TextSize = 12
+	friendsBannerText.TextXAlignment = Enum.TextXAlignment.Left
+	friendsBannerText.TextTruncate = Enum.TextTruncate.AtEnd
+	friendsBannerText.ZIndex = 13
+	friendsBannerText.Parent = friendsBanner
+
+	local friendsScroll = Instance.new("ScrollingFrame")
+	friendsScroll.Name = "FriendsScroll"
+	friendsScroll.Size = UDim2.new(1, 0, 1, -86)
+	friendsScroll.Position = UDim2.fromOffset(0, 86)
+	friendsScroll.BackgroundColor3 = COLORS.BG_CARD
+	friendsScroll.BorderSizePixel = 0
+	friendsScroll.ScrollBarThickness = 4
+	friendsScroll.ScrollBarImageColor3 = COLORS.BORDER
+	friendsScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+	friendsScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	friendsScroll.ScrollingEnabled = true
+	friendsScroll.ZIndex = 12
+	friendsScroll.Parent = friendsContainer
+	applyCorner(friendsScroll, UDim.new(0, 10))
+	applyStroke(friendsScroll, COLORS.BORDER, 1, 0.1)
+	applyPadding(friendsScroll, 10, 10, 10, 10)
+
+	local friendsLayout = Instance.new("UIListLayout")
+	friendsLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	friendsLayout.Padding = UDim.new(0, 8)
+	friendsLayout.Parent = friendsScroll
+
+	uiRefs = {
+		screenGui = screenGui,
+		floatingContainer = floatingContainer,
+		floatingButton = floatingButton,
+		floatStroke = floatStroke,
+		floatStatusDot = floatStatusDot,
+		lockButton = lockButton,
+		lockStroke = lockStroke,
+		lockShackle = lockShackle,
+		shackleStroke = shackleStroke,
+		lockBody = lockBody,
+		mainPanel = mainPanel,
+		titleBar = titleBar,
+		closeButton = closeButton,
+		trackerTabButton = trackerTabButton,
+		trackerTabStroke = trackerTabStroke,
+		friendsTabButton = friendsTabButton,
+		friendsTabStroke = friendsTabStroke,
+		trackerContainer = trackerContainer,
+		friendsContainer = friendsContainer,
+		usernameBox = usernameBox,
+		checkButton = checkButton,
+		autoButton = autoButton,
+		autoStroke = autoStroke,
+		bannerStroke = bannerStroke,
+		bannerText = bannerText,
+		usernameLine = usernameLine,
+		displayNameLine = displayNameLine,
+		userIdLine = userIdLine,
+		statusLine = statusLine,
+		expValueLine = expValueLine,
+		serverTitleLine = serverTitleLine,
+		serverValueLine = serverValueLine,
+		joinServerButton = joinServerButton,
+		joinButtonStroke = joinButtonStroke,
+		serverNoticeLine = serverNoticeLine,
+		lastCheckValueLine = lastCheckValueLine,
+		errorDetailLine = errorDetailLine,
+		friendsRefreshButton = friendsRefreshButton,
+		friendsSummaryText = friendsSummaryText,
+		friendsBannerStroke = friendsBannerStroke,
+		friendsBannerText = friendsBannerText,
+		friendsScroll = friendsScroll,
+	}
+
+	return true
+end
+
+--==============================================================================
+-- 7. LOGIC CẬP NHẬT GIAO DIỆN, TƯƠNG TÁC & AUTO-REFRESH LIÊN TỤC
+--==============================================================================
+local function updateLockVisuals()
+	if state.destroyed or not uiRefs.lockButton then
+		return
+	end
+	if state.isLocked then
+		uiRefs.lockStroke.Color = COLORS.LOCKED
+		uiRefs.shackleStroke.Color = COLORS.LOCKED
+		uiRefs.lockBody.BackgroundColor3 = COLORS.LOCKED
+		uiRefs.lockShackle.Position = UDim2.fromOffset(4, 3) -- Khớp sát thân khóa
+		uiRefs.floatStroke.Color = COLORS.LOCKED
+	else
+		uiRefs.lockStroke.Color = COLORS.UNLOCKED
+		uiRefs.shackleStroke.Color = COLORS.UNLOCKED
+		uiRefs.lockBody.BackgroundColor3 = COLORS.UNLOCKED
+		uiRefs.lockShackle.Position = UDim2.fromOffset(4, 0) -- Nhấc móc khóa lên
+		uiRefs.floatStroke.Color = COLORS.ACCENT
+	end
+end
+
+local function updateAutoButtonVisuals()
+	if state.destroyed or not uiRefs.autoButton then
+		return
+	end
+	if state.autoRefresh then
+		uiRefs.autoButton.Text = "AUTO: ON"
+		uiRefs.autoButton.TextColor3 = COLORS.ONLINE
+		uiRefs.autoStroke.Color = COLORS.ONLINE
+	else
+		uiRefs.autoButton.Text = "AUTO: OFF"
+		uiRefs.autoButton.TextColor3 = COLORS.TEXT_SECONDARY
+		uiRefs.autoStroke.Color = COLORS.BORDER
+	end
+end
+
+local function setBanner(text, color, borderColor)
+	if state.destroyed or not uiRefs.bannerText then
+		return
+	end
+	uiRefs.bannerText.Text = text
+	uiRefs.bannerText.TextColor3 = color or COLORS.TEXT_SECONDARY
+	uiRefs.bannerStroke.Color = borderColor or COLORS.BORDER
+end
+
+local function setFriendsBanner(text, color, borderColor)
+	if state.destroyed or not uiRefs.friendsBannerText then
+		return
+	end
+	uiRefs.friendsBannerText.Text = text
+	uiRefs.friendsBannerText.TextColor3 = color or COLORS.TEXT_SECONDARY
+	uiRefs.friendsBannerStroke.Color = borderColor or COLORS.BORDER
+end
+
+local function setFriendsLoadingState(loading)
+	state.isRefreshingFriends = loading
+	if state.destroyed or not uiRefs.friendsRefreshButton then
+		return
+	end
+	if loading then
+		uiRefs.friendsRefreshButton.Text = "LOADING..."
+		uiRefs.friendsRefreshButton.BackgroundColor3 = COLORS.ACCENT_DARK
+		uiRefs.friendsRefreshButton.TextColor3 = COLORS.TEXT_PRIMARY
+		setFriendsBanner("LOADING... Đang tải danh sách bạn bè...", COLORS.UNKNOWN, COLORS.UNKNOWN)
+	else
+		uiRefs.friendsRefreshButton.Text = "REFRESH"
+		uiRefs.friendsRefreshButton.BackgroundColor3 = COLORS.ACCENT
+		uiRefs.friendsRefreshButton.TextColor3 = COLORS.BG_MAIN
+	end
+end
+
+local function updateTabVisuals()
+	if state.destroyed or not uiRefs.trackerTabButton or not uiRefs.friendsTabButton then
+		return
+	end
+	local isTracker = (state.activeTab == "TRACKER")
+
+	uiRefs.trackerContainer.Visible = isTracker
+	uiRefs.friendsContainer.Visible = not isTracker
+
+	if isTracker then
+		uiRefs.trackerTabButton.BackgroundColor3 = COLORS.ACCENT
+		uiRefs.trackerTabButton.TextColor3 = COLORS.BG_MAIN
+		uiRefs.trackerTabStroke.Color = COLORS.ACCENT
+
+		uiRefs.friendsTabButton.BackgroundColor3 = COLORS.BG_PANEL
+		uiRefs.friendsTabButton.TextColor3 = COLORS.TEXT_SECONDARY
+		uiRefs.friendsTabStroke.Color = COLORS.BORDER
+	else
+		uiRefs.trackerTabButton.BackgroundColor3 = COLORS.BG_PANEL
+		uiRefs.trackerTabButton.TextColor3 = COLORS.TEXT_SECONDARY
+		uiRefs.trackerTabStroke.Color = COLORS.BORDER
+
+		uiRefs.friendsTabButton.BackgroundColor3 = COLORS.ACCENT
+		uiRefs.friendsTabButton.TextColor3 = COLORS.BG_MAIN
+		uiRefs.friendsTabStroke.Color = COLORS.ACCENT
+	end
+end
+
+local function setMenuVisible(visible)
+	state.isMenuOpen = visible
+	if uiRefs.mainPanel then
+		uiRefs.mainPanel.Visible = visible
+	end
+end
+
+local function setLoadingState(loading)
+	state.isChecking = loading
+	if state.destroyed or not uiRefs.checkButton then
+		return
+	end
+	if loading then
+		uiRefs.checkButton.Text = "LOADING..."
+		uiRefs.checkButton.BackgroundColor3 = COLORS.ACCENT_DARK
+		uiRefs.checkButton.TextColor3 = COLORS.TEXT_PRIMARY
+		setBanner("LOADING... Đang truy vấn dữ liệu từ Roblox API", COLORS.UNKNOWN, COLORS.UNKNOWN)
+	else
+		uiRefs.checkButton.Text = "CHECK"
+		uiRefs.checkButton.BackgroundColor3 = COLORS.ACCENT
+		uiRefs.checkButton.TextColor3 = COLORS.BG_MAIN
+	end
+end
+
+local function resetDisplayedResult(pendingUsername)
+	state.currentServerInfo = nil
+	state.isTeleporting = false
+	if state.destroyed or not uiRefs.usernameLine then
+		return
+	end
+
+	uiRefs.usernameLine.Text = "Username: " .. (pendingUsername ~= "" and pendingUsername or "-")
+	uiRefs.displayNameLine.Text = "Display Name: Đang kiểm tra..."
+	uiRefs.userIdLine.Text = "UserId: Đang kiểm tra..."
+	uiRefs.statusLine.Text = "STATUS: LOADING..."
+	uiRefs.statusLine.TextColor3 = COLORS.UNKNOWN
+	uiRefs.floatStatusDot.BackgroundColor3 = COLORS.UNKNOWN
+	uiRefs.expValueLine.Text = "Đang kiểm tra..."
+
+	uiRefs.serverTitleLine.Visible = false
+	uiRefs.serverValueLine.Visible = false
+	uiRefs.serverValueLine.Text = ""
+	uiRefs.joinServerButton.Visible = false
+	uiRefs.serverNoticeLine.Visible = false
+	uiRefs.serverNoticeLine.Text = ""
+	uiRefs.lastCheckValueLine.Text = "-"
+	uiRefs.errorDetailLine.Visible = false
+	uiRefs.errorDetailLine.Text = ""
+end
+
+local function renderResult(result)
+	if state.destroyed or not uiRefs.usernameLine then
+		return
+	end
+
+	uiRefs.usernameLine.Text = "Username: " .. tostring(result.username)
+	uiRefs.displayNameLine.Text = "Display Name: " .. tostring(result.displayName)
+	uiRefs.userIdLine.Text = "UserId: " .. tostring(result.userIdText)
+	uiRefs.statusLine.Text = "STATUS: " .. tostring(result.status)
+	uiRefs.expValueLine.Text = tostring(result.experience)
+	uiRefs.lastCheckValueLine.Text = tostring(result.lastCheck)
+
+	if result.status == "ONLINE" then
+		uiRefs.statusLine.TextColor3 = COLORS.ONLINE
+		uiRefs.floatStatusDot.BackgroundColor3 = COLORS.ONLINE
+	elseif result.status == "OFFLINE" then
+		uiRefs.statusLine.TextColor3 = COLORS.OFFLINE
+		uiRefs.floatStatusDot.BackgroundColor3 = COLORS.OFFLINE
+	else
+		uiRefs.statusLine.TextColor3 = COLORS.UNKNOWN
+		uiRefs.floatStatusDot.BackgroundColor3 = COLORS.UNKNOWN
+	end
+
+	-- Cập nhật thông tin server & nút JOIN SERVER (luôn xóa dữ liệu server cũ)
+	if result.canJoinServer and type(result.serverPlaceId) == "number" and type(result.serverJobId) == "string" then
+		state.currentServerInfo = {
+			placeId = result.serverPlaceId,
+			gameId = result.serverJobId,
+		}
+	else
+		state.currentServerInfo = nil
+	end
+
+	if result.showJoinRow then
+		uiRefs.serverTitleLine.Visible = true
+		uiRefs.serverValueLine.Visible = true
+		uiRefs.serverValueLine.Text = tostring(result.serverStatus or "Unable to determine")
+		uiRefs.joinServerButton.Visible = true
+
+		if state.currentServerInfo then
+			uiRefs.serverValueLine.TextColor3 = COLORS.ONLINE
+			uiRefs.joinServerButton.Text = state.isTeleporting and "ĐANG THAM GIA SERVER..." or "JOIN SERVER"
+			uiRefs.joinServerButton.BackgroundColor3 = COLORS.ONLINE
+			uiRefs.joinServerButton.TextColor3 = COLORS.BG_MAIN
+			uiRefs.joinButtonStroke.Color = COLORS.ONLINE
+		else
+			uiRefs.serverValueLine.TextColor3 = COLORS.UNKNOWN
+			uiRefs.joinServerButton.Text = "JOIN SERVER không khả dụng"
+			uiRefs.joinServerButton.BackgroundColor3 = COLORS.BG_INPUT
+			uiRefs.joinServerButton.TextColor3 = COLORS.TEXT_SECONDARY
+			uiRefs.joinButtonStroke.Color = COLORS.BORDER
+		end
+	else
+		uiRefs.serverTitleLine.Visible = false
+		uiRefs.serverValueLine.Visible = false
+		uiRefs.serverValueLine.Text = ""
+		uiRefs.joinServerButton.Visible = false
+	end
+
+	if result.serverNotice and result.serverNotice ~= "" then
+		uiRefs.serverNoticeLine.Text = tostring(result.serverNotice)
+		uiRefs.serverNoticeLine.Visible = true
+	else
+		uiRefs.serverNoticeLine.Text = ""
+		uiRefs.serverNoticeLine.Visible = false
+	end
+
+	if result.errorMessage and result.errorMessage ~= "" then
+		uiRefs.errorDetailLine.Text = "Lý do / Lỗi: " .. tostring(result.errorMessage)
+		uiRefs.errorDetailLine.Visible = true
+		setBanner("Lỗi: " .. tostring(result.errorMessage), COLORS.OFFLINE, COLORS.OFFLINE)
+	else
+		uiRefs.errorDetailLine.Text = ""
+		uiRefs.errorDetailLine.Visible = false
+		if state.autoRefresh and state.activeTargetUsername ~= "" then
+			setBanner("Cập nhật thành công. Tự động làm mới sau " .. tostring(CONFIG.AUTO_REFRESH_INTERVAL) .. "s.", COLORS.ONLINE, COLORS.BORDER)
+		else
+			setBanner("Kiểm tra hoàn tất lúc " .. tostring(result.lastCheck), COLORS.ONLINE, COLORS.BORDER)
+		end
+	end
+end
+
+local function joinCurrentServer()
+	if state.destroyed or state.isTeleporting then
+		return
+	end
+
+	local serverInfo = state.currentServerInfo
+	if not serverInfo or type(serverInfo.placeId) ~= "number" or type(serverInfo.gameId) ~= "string" then
+		setBanner("Không thể xác định server hiện tại của người chơi.", COLORS.UNKNOWN, COLORS.UNKNOWN)
+		return
+	end
+
+	local localPlayer = Players.LocalPlayer
+	if not localPlayer then
+		setBanner("Không tìm thấy LocalPlayer để thực hiện teleport.", COLORS.OFFLINE, COLORS.OFFLINE)
+		return
+	end
+
+	if game.PlaceId == serverInfo.placeId and game.JobId == serverInfo.gameId then
+		setBanner("Bạn đang ở trong đúng server này rồi.", COLORS.ONLINE, COLORS.ONLINE)
+		return
+	end
+
+	state.isTeleporting = true
+	if uiRefs.joinServerButton then
+		uiRefs.joinServerButton.Text = "ĐANG THAM GIA SERVER..."
+	end
+	setBanner("Đang kết nối vào đúng server (" .. serverInfo.gameId .. ")...", COLORS.ACCENT, COLORS.ACCENT)
+
+	local okTeleport, errTeleport = pcall(function()
+		TeleportService:TeleportToPlaceInstance(serverInfo.placeId, serverInfo.gameId, localPlayer)
+	end)
+
+	if not okTeleport then
+		state.isTeleporting = false
+		if uiRefs.joinServerButton and state.currentServerInfo then
+			uiRefs.joinServerButton.Text = "JOIN SERVER"
+		end
+		local errMsg = "Không thể tham gia server: " .. tostring(errTeleport)
+		uiRefs.errorDetailLine.Text = errMsg
+		uiRefs.errorDetailLine.Visible = true
+		setBanner(errMsg, COLORS.OFFLINE, COLORS.OFFLINE)
+	end
+end
+
+local function renderFriendsList() end
+
+local function joinFriendServer(friendEntry)
+	if state.destroyed or state.isTeleporting then
+		return
+	end
+
+	if not friendEntry or friendEntry.status ~= "ONLINE" or not friendEntry.isInGame then
+		setFriendsBanner("Unable to join this server.", COLORS.OFFLINE, COLORS.OFFLINE)
+		return
+	end
+
+	local localPlayer = Players.LocalPlayer
+	if not localPlayer then
+		setFriendsBanner("Unable to join this server.", COLORS.OFFLINE, COLORS.OFFLINE)
+		return
+	end
+
+	local placeId = friendEntry.placeId
+	local jobId = friendEntry.jobId
+
+	if type(placeId) ~= "number" or placeId <= 0 then
+		setFriendsBanner("Unable to join this server.", COLORS.OFFLINE, COLORS.OFFLINE)
+		return
+	end
+
+	if game.PlaceId == placeId and isValidServerJobId(jobId) and game.JobId == jobId then
+		setFriendsBanner("Bạn đang ở trong đúng server của " .. tostring(friendEntry.username) .. ".", COLORS.ONLINE, COLORS.ONLINE)
+		return
+	end
+
+	state.isTeleporting = true
+	state.activeFriendJoinUserId = friendEntry.userId
+
+	local okTeleport = false
+	if isValidServerJobId(jobId) then
+		setFriendsBanner("Đang tham gia đúng server của " .. tostring(friendEntry.username) .. "...", COLORS.ACCENT, COLORS.ACCENT)
+		okTeleport = pcall(function()
+			TeleportService:TeleportToPlaceInstance(placeId, jobId, localPlayer)
+		end)
+	else
+		-- Nếu Roblox không cung cấp JobId riêng của bạn bè, dùng Teleport chính thức theo PlaceId hợp lệ
+		setFriendsBanner("Đang tham gia Experience của " .. tostring(friendEntry.username) .. "...", COLORS.ACCENT, COLORS.ACCENT)
+		okTeleport = pcall(function()
+			TeleportService:Teleport(placeId, localPlayer)
+		end)
+	end
+
+	if not okTeleport then
+		state.isTeleporting = false
+		state.activeFriendJoinUserId = nil
+		setFriendsBanner("Unable to join this server.", COLORS.OFFLINE, COLORS.OFFLINE)
+	else
+		local joinedUid = friendEntry.userId
+		task.delay(10, function()
+			if not state.destroyed and state.isTeleporting and state.activeFriendJoinUserId == joinedUid then
+				state.isTeleporting = false
+				state.activeFriendJoinUserId = nil
+			end
+		end)
+	end
+end
+
+local function toggleFriendPin(userId)
+	if state.destroyed then
+		return
+	end
+	local key = tostring(userId)
+	if state.pinnedUserIds[key] then
+		state.pinnedUserIds[key] = nil
+	else
+		state.pinnedUserIds[key] = true
+	end
+	savePinnedFriends()
+
+	for _, item in ipairs(state.friendsList) do
+		item.isPinned = isFriendPinned(item.userId)
+	end
+	sortFriendsList(state.friendsList)
+	renderFriendsList()
+end
+
+renderFriendsList = function()
+	if state.destroyed or not uiRefs.friendsScroll then
+		return
+	end
+
+	-- Dọn kết nối và các card cũ trước khi vẽ lại (tránh trùng lặp hoặc rò rỉ bộ nhớ)
+	clearFriendCardConnections()
+	for _, child in ipairs(uiRefs.friendsScroll:GetChildren()) do
+		if not child:IsA("UIListLayout") and not child:IsA("UIPadding") then
+			pcall(function()
+				child:Destroy()
+			end)
+		end
+	end
+
+	local friends = state.friendsList or {}
+	local onlineCount = 0
+	local pinnedCount = 0
+	for _, f in ipairs(friends) do
+		if f.status == "ONLINE" then
+			onlineCount += 1
+		end
+		if f.isPinned then
+			pinnedCount += 1
+		end
+	end
+
+	if uiRefs.friendsSummaryText then
+		uiRefs.friendsSummaryText.Text = string.format("Online: %d | Pinned: %d | All: %d", onlineCount, pinnedCount, #friends)
+	end
+
+	if #friends == 0 then
+		local emptyLabel = Instance.new("TextLabel")
+		emptyLabel.Name = "EmptyFriendsLabel"
+		emptyLabel.Size = UDim2.new(1, 0, 0, 54)
+		emptyLabel.BackgroundTransparency = 1
+		emptyLabel.Text = "Không có bạn bè để hiển thị."
+		emptyLabel.TextColor3 = COLORS.TEXT_SECONDARY
+		emptyLabel.Font = Enum.Font.GothamMedium
+		emptyLabel.TextSize = 13
+		emptyLabel.TextWrapped = true
+		emptyLabel.LayoutOrder = 1
+		emptyLabel.ZIndex = 13
+		emptyLabel.Parent = uiRefs.friendsScroll
+		return
+	end
+
+	local orderCounter = 0
+	local function addGroupHeader(title, color)
+		orderCounter += 1
+		local header = Instance.new("TextLabel")
+		header.Name = "GroupHeader_" .. tostring(orderCounter)
+		header.Size = UDim2.new(1, 0, 0, 22)
+		header.BackgroundTransparency = 1
+		header.Text = title
+		header.TextColor3 = color
+		header.Font = Enum.Font.GothamBold
+		header.TextSize = 12
+		header.TextXAlignment = Enum.TextXAlignment.Left
+		header.LayoutOrder = orderCounter
+		header.ZIndex = 13
+		header.Parent = uiRefs.friendsScroll
+	end
+
+	local addedPinnedHeader = false
+	local addedOthersHeader = false
+
+	for _, friend in ipairs(friends) do
+		if friend.isPinned and not addedPinnedHeader then
+			addedPinnedHeader = true
+			addGroupHeader("PINNED FRIENDS", COLORS.PINNED)
+		elseif not friend.isPinned and not addedOthersHeader then
+			addedOthersHeader = true
+			addGroupHeader(addedPinnedHeader and "OTHER FRIENDS" or "ALL FRIENDS", COLORS.ACCENT)
+		end
+
+		orderCounter += 1
+		local card = Instance.new("Frame")
+		card.Name = "FriendCard_" .. tostring(friend.userId)
+		card.Size = UDim2.new(1, 0, 0, 0)
+		card.AutomaticSize = Enum.AutomaticSize.Y
+		card.BackgroundColor3 = COLORS.BG_INPUT
+		card.LayoutOrder = orderCounter
+		card.ZIndex = 13
+		card.Parent = uiRefs.friendsScroll
+		applyCorner(card, UDim.new(0, 10))
+		applyStroke(card, friend.isPinned and COLORS.PINNED or COLORS.BORDER, 1, friend.isPinned and 0.25 or 0.15)
+		applyPadding(card, 10, 10, 10, 10)
+
+		local cardLayout = Instance.new("UIListLayout")
+		cardLayout.SortOrder = Enum.SortOrder.LayoutOrder
+		cardLayout.Padding = UDim.new(0, 6)
+		cardLayout.Parent = card
+
+		-- Hàng 1: Dot trạng thái + Username / Display Name + Nhãn PINNED
+		local topRow = Instance.new("Frame")
+		topRow.Name = "TopRow"
+		topRow.Size = UDim2.new(1, 0, 0, 0)
+		topRow.AutomaticSize = Enum.AutomaticSize.Y
+		topRow.BackgroundTransparency = 1
+		topRow.LayoutOrder = 1
+		topRow.ZIndex = 14
+		topRow.Parent = card
+
+		local statusColor = COLORS.UNKNOWN
+		if friend.status == "ONLINE" then
+			statusColor = COLORS.ONLINE
+		elseif friend.status == "OFFLINE" then
+			statusColor = COLORS.OFFLINE
+		end
+
+		local dot = Instance.new("Frame")
+		dot.Name = "StatusDot"
+		dot.Size = UDim2.fromOffset(10, 10)
+		dot.Position = UDim2.fromOffset(0, 4)
+		dot.BackgroundColor3 = statusColor
+		dot.ZIndex = 15
+		dot.Parent = topRow
+		applyCorner(dot, UDim.new(1, 0))
+
+		local titleStr = friend.username
+		if friend.displayName and friend.displayName ~= "" and friend.displayName ~= friend.username then
+			titleStr = friend.displayName .. " (@" .. friend.username .. ")"
+		end
+		if friend.isPinned then
+			titleStr = "[PINNED] " .. titleStr
+		end
+
+		local nameLabel = Instance.new("TextLabel")
+		nameLabel.Name = "NameLabel"
+		nameLabel.Size = UDim2.new(1, -18, 0, 0)
+		nameLabel.Position = UDim2.fromOffset(18, 0)
+		nameLabel.AutomaticSize = Enum.AutomaticSize.Y
+		nameLabel.BackgroundTransparency = 1
+		nameLabel.Text = titleStr
+		nameLabel.TextColor3 = COLORS.TEXT_PRIMARY
+		nameLabel.Font = Enum.Font.GothamBold
+		nameLabel.TextSize = 13
+		nameLabel.TextWrapped = true
+		nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+		nameLabel.TextYAlignment = Enum.TextYAlignment.Top
+		nameLabel.ZIndex = 15
+		nameLabel.Parent = topRow
+
+		-- Hàng 2: Trạng thái ONLINE / OFFLINE / UNKNOWN & Experience hiện tại
+		local statusTextLabel = Instance.new("TextLabel")
+		statusTextLabel.Name = "StatusLabel"
+		statusTextLabel.Size = UDim2.new(1, 0, 0, 0)
+		statusTextLabel.AutomaticSize = Enum.AutomaticSize.Y
+		statusTextLabel.BackgroundTransparency = 1
+		statusTextLabel.Text = tostring(friend.status) .. " • " .. tostring(friend.experienceText)
+		statusTextLabel.TextColor3 = (friend.status == "ONLINE") and (friend.isInGame and COLORS.ONLINE or COLORS.ACCENT) or ((friend.status == "OFFLINE") and COLORS.TEXT_SECONDARY or COLORS.UNKNOWN)
+		statusTextLabel.Font = Enum.Font.GothamMedium
+		statusTextLabel.TextSize = 12
+		statusTextLabel.TextWrapped = true
+		statusTextLabel.TextXAlignment = Enum.TextXAlignment.Left
+		statusTextLabel.LayoutOrder = 2
+		statusTextLabel.ZIndex = 14
+		statusTextLabel.Parent = card
+
+		-- Hàng 3: Các nút thao tác nhanh cho điện thoại (JOIN khi đang trong game + PIN/UNPIN)
+		local btnRow = Instance.new("Frame")
+		btnRow.Name = "ButtonRow"
+		btnRow.Size = UDim2.new(1, 0, 0, 36)
+		btnRow.BackgroundTransparency = 1
+		btnRow.LayoutOrder = 3
+		btnRow.ZIndex = 14
+		btnRow.Parent = card
+
+		if friend.canJoin then
+			local joinBtn = Instance.new("TextButton")
+			joinBtn.Name = "JoinButton"
+			joinBtn.Size = UDim2.new(0.55, -4, 1, 0)
+			joinBtn.Position = UDim2.fromScale(0, 0)
+			joinBtn.BackgroundColor3 = COLORS.ONLINE
+			joinBtn.Text = "JOIN"
+			joinBtn.TextColor3 = COLORS.BG_MAIN
+			joinBtn.Font = Enum.Font.GothamBold
+			joinBtn.TextSize = 13
+			joinBtn.AutoButtonColor = false
+			joinBtn.ZIndex = 15
+			joinBtn.Parent = btnRow
+			applyCorner(joinBtn, UDim.new(0, 8))
+
+			local capturedFriend = friend
+			table.insert(state.friendCardConnections, joinBtn.Activated:Connect(function()
+				if state.destroyed then
+					return
+				end
+				joinFriendServer(capturedFriend)
+			end))
+		end
+
+		local pinBtn = Instance.new("TextButton")
+		pinBtn.Name = "PinButton"
+		if friend.canJoin then
+			pinBtn.Size = UDim2.new(0.45, -4, 1, 0)
+			pinBtn.Position = UDim2.new(0.55, 4, 0, 0)
+		else
+			pinBtn.Size = UDim2.new(1, 0, 1, 0)
+			pinBtn.Position = UDim2.fromScale(0, 0)
+		end
+		pinBtn.BackgroundColor3 = COLORS.BG_PANEL
+		pinBtn.Text = friend.isPinned and "UNPIN" or "PIN"
+		pinBtn.TextColor3 = friend.isPinned and COLORS.PINNED or COLORS.TEXT_PRIMARY
+		pinBtn.Font = Enum.Font.GothamBold
+		pinBtn.TextSize = 13
+		pinBtn.AutoButtonColor = false
+		pinBtn.ZIndex = 15
+		pinBtn.Parent = btnRow
+		applyCorner(pinBtn, UDim.new(0, 8))
+		applyStroke(pinBtn, friend.isPinned and COLORS.PINNED or COLORS.BORDER, 1, 0.2)
+
+		local capturedUserId = friend.userId
+		table.insert(state.friendCardConnections, pinBtn.Activated:Connect(function()
+			if state.destroyed then
+				return
+			end
+			toggleFriendPin(capturedUserId)
+		end))
+	end
+end
+
+local function executeFriendsRefresh(isManual)
+	if state.destroyed then
+		return
+	end
+
+	local now = os.clock()
+	if isManual then
+		local remain = CONFIG.FRIENDS_REFRESH_COOLDOWN - (now - state.lastFriendsRefreshTime)
+		if remain > 0 then
+			setFriendsBanner(string.format("Vui lòng đợi %.1fs trước khi làm mới lại.", remain), COLORS.UNKNOWN, COLORS.UNKNOWN)
+			return
+		end
+		if state.isRefreshingFriends then
+			setFriendsBanner("Đang tải danh sách bạn bè, vui lòng chờ...", COLORS.UNKNOWN, COLORS.UNKNOWN)
+			return
+		end
+		state.lastFriendsRefreshTime = now
+	else
+		if state.isRefreshingFriends then
+			return
+		end
+	end
+
+	state.activeFriendsRequestId += 1
+	local currentReqId = state.activeFriendsRequestId
+	setFriendsLoadingState(true)
+
+	task.spawn(function()
+		local ok, friends, errMsg, timestamp = resolveFriendsList()
+		if state.destroyed or currentReqId ~= state.activeFriendsRequestId then
+			return
+		end
+
+		setFriendsLoadingState(false)
+		state.friendsLoadedOnce = true
+		state.nextFriendsAutoTime = os.clock() + CONFIG.FRIENDS_AUTO_INTERVAL
+
+		if ok then
+			state.friendsList = friends
+			renderFriendsList()
+			if errMsg and errMsg ~= "" then
+				setFriendsBanner(errMsg, COLORS.UNKNOWN, COLORS.UNKNOWN)
+			else
+				setFriendsBanner("Cập nhật FRIENDS lúc " .. tostring(timestamp), COLORS.ONLINE, COLORS.BORDER)
+			end
+		else
+			setFriendsBanner("Lỗi: " .. tostring(errMsg or "Không thể tải danh sách bạn bè."), COLORS.OFFLINE, COLORS.OFFLINE)
+		end
+	end)
+end
+
+local function switchTab(tabName)
+	if state.destroyed then
+		return
+	end
+	if tabName ~= "TRACKER" and tabName ~= "FRIENDS" then
+		return
+	end
+	state.activeTab = tabName
+	updateTabVisuals()
+
+	if tabName == "FRIENDS" and not state.friendsLoadedOnce and not state.isRefreshingFriends then
+		executeFriendsRefresh(false)
+	end
+end
+
+local function executeCheck(rawUsername, isManual)
+	if state.destroyed then
+		return
+	end
+
+	local cleanName = normalizeUsername(rawUsername)
+	local now = os.clock()
+
+	if isManual then
+		local remain = CONFIG.MANUAL_COOLDOWN - (now - state.lastManualCheckTime)
+		if remain > 0 then
+			setBanner(string.format("Vui lòng đợi %.1fs trước lần kiểm tra tiếp theo.", remain), COLORS.UNKNOWN, COLORS.UNKNOWN)
+			return
+		end
+		if state.isChecking then
+			setBanner("Đang kiểm tra, vui lòng chờ hoàn tất...", COLORS.UNKNOWN, COLORS.UNKNOWN)
+			return
+		end
+		state.lastManualCheckTime = now
+	else
+		if state.isChecking then
+			return
+		end
+	end
+
+	-- Luôn xóa dữ liệu kết quả & JobId/server cũ trước khi lấy dữ liệu mới
+	state.currentServerInfo = nil
+
+	if cleanName == "" then
+		state.activeTargetUsername = ""
+		resetDisplayedResult("")
+		renderResult(resolvePlayerStatus(""))
+		return
+	end
+
+	if isManual then
+		resetDisplayedResult(cleanName)
+	end
+
+	state.activeTargetUsername = cleanName
+	state.activeRequestId += 1
+	local currentRequestId = state.activeRequestId
+
+	setLoadingState(true)
+
+	task.spawn(function()
+		local result = resolvePlayerStatus(cleanName)
+		if state.destroyed or currentRequestId ~= state.activeRequestId then
+			return
+		end
+
+		setLoadingState(false)
+		if result.shouldStopAuto then
+			state.activeTargetUsername = ""
+		end
+		renderResult(result)
+
+		local interval = result.rateLimited and CONFIG.RATE_LIMIT_BACKOFF or CONFIG.AUTO_REFRESH_INTERVAL
+		state.nextAutoCheckTime = os.clock() + interval
+	end)
+end
+
+local function updateResponsiveLayout()
+	if state.destroyed or not uiRefs.mainPanel or not uiRefs.floatingContainer then
+		return
+	end
+	local vp = getViewportSize()
+	local newW = math.clamp(vp.X - 24, 260, 380)
+	local newH = math.clamp(vp.Y - 36, 300, 488)
+	uiRefs.mainPanel.Size = UDim2.fromOffset(newW, newH)
+
+	local curPanelPos = uiRefs.mainPanel.AbsolutePosition
+	local clampedPX, clampedPY = clampPositionToScreen(curPanelPos.X, curPanelPos.Y, newW, newH, CONFIG.SCREEN_MARGIN)
+	uiRefs.mainPanel.Position = UDim2.fromOffset(clampedPX, clampedPY)
+
+	local floatSize = uiRefs.floatingContainer.AbsoluteSize
+	local curFloatPos = uiRefs.floatingContainer.AbsolutePosition
+	local clampedFX, clampedFY = clampPositionToScreen(curFloatPos.X, curFloatPos.Y, floatSize.X, floatSize.Y, CONFIG.SCREEN_MARGIN)
+	uiRefs.floatingContainer.Position = UDim2.fromOffset(clampedFX, clampedFY)
+end
+
+local function bindCameraResizeListener()
+	local camConn = nil
+	local function attachToCamera()
+		if camConn then
+			pcall(function()
+				camConn:Disconnect()
+			end)
+			camConn = nil
+		end
+		local cam = workspace.CurrentCamera
+		if cam then
+			camConn = trackConnection(cam:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+				updateResponsiveLayout()
+			end))
+		end
+	end
+
+	attachToCamera()
+	trackConnection(workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+		attachToCamera()
+		updateResponsiveLayout()
+	end))
+end
+
+local function bindEvents()
+	-- 1. Nút nổi: Nhấn để đóng/mở menu (luôn hoạt động kể cả khi đang khóa), kéo để di chuyển khi mở khóa
+	bindDragAndTap(uiRefs.floatingButton, uiRefs.floatingContainer, {
+		canDrag = function()
+			return not state.isLocked
+		end,
+		onTap = function()
+			setMenuVisible(not state.isMenuOpen)
+		end,
+	})
+
+	-- 2. Nút ổ khóa: Độc lập hoàn toàn với nút nổi, chỉ khóa/mở khóa việc di chuyển nút nổi
+	trackConnection(uiRefs.lockButton.Activated:Connect(function()
+		if state.destroyed then
+			return
+		end
+		state.isLocked = not state.isLocked
+		updateLockVisuals()
+	end))
+
+	-- 3. Thanh tiêu đề: Kéo bảng giao diện chính
+	bindDragAndTap(uiRefs.titleBar, uiRefs.mainPanel, {
+		canDrag = function()
+			return true
+		end,
+		onTap = nil,
+	})
+
+	-- 4. Nút X: Đóng giao diện chính (không làm hỏng nút nổi)
+	trackConnection(uiRefs.closeButton.Activated:Connect(function()
+		if state.destroyed then
+			return
+		end
+		setMenuVisible(false)
+	end))
+
+	-- 4B. Chuyển đổi giữa tab TRACKER và tab FRIENDS
+	trackConnection(uiRefs.trackerTabButton.Activated:Connect(function()
+		if state.destroyed then
+			return
+		end
+		switchTab("TRACKER")
+	end))
+
+	trackConnection(uiRefs.friendsTabButton.Activated:Connect(function()
+		if state.destroyed then
+			return
+		end
+		switchTab("FRIENDS")
+	end))
+
+	-- 4C. Nút REFRESH trong tab FRIENDS
+	trackConnection(uiRefs.friendsRefreshButton.Activated:Connect(function()
+		if state.destroyed then
+			return
+		end
+		executeFriendsRefresh(true)
+	end))
+
+	-- 5. Nút CHECK & phím Enter trong ô nhập username
+	trackConnection(uiRefs.checkButton.Activated:Connect(function()
+		if state.destroyed then
+			return
+		end
+		executeCheck(uiRefs.usernameBox.Text, true)
+	end))
+
+	trackConnection(uiRefs.usernameBox.FocusLost:Connect(function(enterPressed)
+		if state.destroyed then
+			return
+		end
+		if enterPressed then
+			executeCheck(uiRefs.usernameBox.Text, true)
+		end
+	end))
+
+	-- 6. Nút bật/tắt tự động cập nhật liên tục
+	trackConnection(uiRefs.autoButton.Activated:Connect(function()
+		if state.destroyed then
+			return
+		end
+		state.autoRefresh = not state.autoRefresh
+		updateAutoButtonVisuals()
+		if state.autoRefresh and state.activeTargetUsername ~= "" then
+			state.nextAutoCheckTime = os.clock() + CONFIG.AUTO_REFRESH_INTERVAL
+			setBanner("Đã bật tự động cập nhật (" .. tostring(CONFIG.AUTO_REFRESH_INTERVAL) .. "s/lần).", COLORS.ONLINE, COLORS.BORDER)
+		elseif not state.autoRefresh then
+			setBanner("Đã tắt tự động cập nhật. Nhấn CHECK để kiểm tra thủ công.", COLORS.TEXT_SECONDARY, COLORS.BORDER)
+		end
+	end))
+
+	-- 7. Nút JOIN SERVER & xử lý lỗi TeleportInitFailed
+	trackConnection(uiRefs.joinServerButton.Activated:Connect(function()
+		if state.destroyed then
+			return
+		end
+		joinCurrentServer()
+	end))
+
+	trackConnection(TeleportService.TeleportInitFailed:Connect(function(player, teleportResult, errorMessage)
+		if state.destroyed then
+			return
+		end
+		if player == Players.LocalPlayer then
+			local wasFriendJoin = (state.activeFriendJoinUserId ~= nil)
+			state.isTeleporting = false
+			state.activeFriendJoinUserId = nil
+			if wasFriendJoin then
+				setFriendsBanner("Unable to join this server.", COLORS.OFFLINE, COLORS.OFFLINE)
+			else
+				if uiRefs.joinServerButton and state.currentServerInfo then
+					uiRefs.joinServerButton.Text = "JOIN SERVER"
+				end
+				local msg = "Tham gia server thất bại (" .. tostring(teleportResult.Name) .. "): " .. tostring(errorMessage)
+				if uiRefs.errorDetailLine then
+					uiRefs.errorDetailLine.Text = msg
+					uiRefs.errorDetailLine.Visible = true
+				end
+				setBanner(msg, COLORS.OFFLINE, COLORS.OFFLINE)
+			end
+		end
+	end))
+
+	bindCameraResizeListener()
+end
+
+local function startAutoRefreshLoop()
+	task.spawn(function()
+		while not state.destroyed do
+			task.wait(1)
+			if state.destroyed then
+				break
+			end
+
+			if state.autoRefresh and state.activeTargetUsername ~= "" and not state.isChecking then
+				local remaining = math.ceil(state.nextAutoCheckTime - os.clock())
+				if remaining <= 0 then
+					executeCheck(state.activeTargetUsername, false)
+				else
+					-- Hiển thị bộ đếm ngược nhẹ khi không có lỗi đang hiển thị
+					if uiRefs.errorDetailLine and not uiRefs.errorDetailLine.Visible then
+						setBanner("Cập nhật liên tục: làm mới sau " .. tostring(remaining) .. "s", COLORS.TEXT_SECONDARY, COLORS.BORDER)
+					end
+				end
+			end
+
+			-- Tự động làm mới nhẹ danh sách FRIENDS khi người dùng đang mở menu ở tab FRIENDS
+			if state.isMenuOpen and state.activeTab == "FRIENDS" and state.friendsLoadedOnce and not state.isRefreshingFriends then
+				if os.clock() >= state.nextFriendsAutoTime then
+					executeFriendsRefresh(false)
+				end
+			end
+		end
+	end)
+end
+
+--==============================================================================
+-- 8. KHỞI CHẠY CHÍNH
+--==============================================================================
+loadPinnedFriends()
+local built = buildUI()
+if built then
+	updateLockVisuals()
+	updateAutoButtonVisuals()
+	updateTabVisuals()
+	bindEvents()
+	startAutoRefreshLoop()
+
+	-- Kiểm tra sẵn khả năng HTTP khi mở để cảnh báo sớm nếu chạy trong môi trường không hỗ trợ
+	if not detectHttpRequest() then
+		setBanner("Cảnh báo: Môi trường này không hỗ trợ HTTP request.", COLORS.UNKNOWN, COLORS.UNKNOWN)
+	end
+end
