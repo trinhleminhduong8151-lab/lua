@@ -1,0 +1,1511 @@
+--[[
+	============================================================================
+	PLAYER STATUS TRACKER (Roblox Luau - Mobile & Executor Compatible)
+	============================================================================
+	Mô tả:
+	- Tra cứu thông tin người chơi Roblox bất kỳ qua username (không cần kết bạn).
+	- Kiểm tra UserId, Display Name, trạng thái ONLINE / OFFLINE / UNKNOWN,
+	  và tên Experience đang chơi (nếu Roblox Presence API cung cấp universeId).
+	- Giao diện tối ưu cho màn hình cảm ứng điện thoại (Android & PC),
+	  có nút nổi (Floating Button), nút khóa vị trí (Lock Button) hoạt động độc lập,
+	  kéo bảng bằng thanh tiêu đề, chống tạo UI trùng lặp và tự động cập nhật định kỳ.
+
+	Lưu ý kỹ thuật về Roblox API:
+	- Không sử dụng cookie .ROBLOSECURITY hay thông tin đăng nhập.
+	- Presence API (presence.roblox.com/v1/presence/users) là API công khai nhưng
+	  khi gọi không xác thực (hoặc theo cài đặt riêng tư của người chơi),
+	  Roblox vẫn trả về userPresenceType (0=Offline, 1=Online, 2=InGame, 3=InStudio),
+	  nhưng thường ẩn (null) các trường universeId / placeId / lastLocation.
+	  Khi không có đủ dữ liệu universeId, script hiển thị trung thực "Không xác định được".
+	============================================================================
+]]
+
+--==============================================================================
+-- 1. KHỞI TẠO SERVICES & DỌN DẸP PHIÊN BẢN CŨ (CHỐNG TRÙNG LẶP)
+--==============================================================================
+local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+local UserInputService = game:GetService("UserInputService")
+local CoreGui = game:GetService("CoreGui")
+
+local CONFIG = {
+	APP_NAME = "Player Status Tracker",
+	GUI_NAME = "PlayerStatusTracker_UI",
+	CLEANUP_KEY = "__PlayerStatusTrackerCleanup_v1",
+	MANUAL_COOLDOWN = 2.5,       -- Thời gian chờ tối thiểu giữa các lần bấm CHECK (giây)
+	AUTO_REFRESH_INTERVAL = 15,  -- Chu kỳ tự động cập nhật liên tục (giây)
+	RATE_LIMIT_BACKOFF = 30,     -- Thời gian chờ khi gặp HTTP 429 (giây)
+	REQUEST_TIMEOUT = 12,        -- Thời gian chờ tối đa mỗi HTTP request (giây)
+	DRAG_THRESHOLD = 8,          -- Ngưỡng pixel phân biệt chạm (tap) và kéo (drag) trên cảm ứng
+	FLOATING_BTN_SIZE = 52,      -- Kích thước nút nổi (50-55 px)
+	LOCK_BTN_SIZE = 34,          -- Kích thước nút ổ khóa bên cạnh
+	SCREEN_MARGIN = 8,           -- Lề an toàn không cho UI vượt khỏi màn hình
+}
+
+local COLORS = {
+	BG_MAIN = Color3.fromRGB(15, 23, 42),
+	BG_PANEL = Color3.fromRGB(22, 33, 54),
+	BG_INPUT = Color3.fromRGB(30, 41, 59),
+	BG_CARD = Color3.fromRGB(18, 27, 46),
+	BORDER = Color3.fromRGB(51, 65, 85),
+	ACCENT = Color3.fromRGB(56, 189, 248),
+	ACCENT_DARK = Color3.fromRGB(14, 116, 144),
+	TEXT_PRIMARY = Color3.fromRGB(241, 245, 249),
+	TEXT_SECONDARY = Color3.fromRGB(148, 163, 184),
+	TEXT_MUTED = Color3.fromRGB(100, 116, 139),
+	ONLINE = Color3.fromRGB(34, 197, 94),
+	OFFLINE = Color3.fromRGB(239, 68, 68),
+	UNKNOWN = Color3.fromRGB(245, 158, 11),
+	LOCKED = Color3.fromRGB(245, 158, 11),
+	UNLOCKED = Color3.fromRGB(56, 189, 248),
+	CLOSE_RED = Color3.fromRGB(220, 38, 38),
+}
+
+local function getGlobalEnv()
+	if type(getgenv) == "function" then
+		local ok, env = pcall(getgenv)
+		if ok and type(env) == "table" then
+			return env
+		end
+	end
+	return _G
+end
+
+local function getPreferredGuiParent()
+	if type(gethui) == "function" then
+		local ok, hiddenUi = pcall(gethui)
+		if ok and typeof(hiddenUi) == "Instance" then
+			return hiddenUi
+		end
+	end
+
+	local okCore, coreAvailable = pcall(function()
+		return CoreGui and CoreGui.Name
+	end)
+	if okCore and coreAvailable then
+		return CoreGui
+	end
+
+	local localPlayer = Players.LocalPlayer
+	if localPlayer then
+		return localPlayer:WaitForChild("PlayerGui")
+	end
+	return nil
+end
+
+local function removeExistingGuis()
+	local containers = {}
+	if type(gethui) == "function" then
+		local ok, hiddenUi = pcall(gethui)
+		if ok and typeof(hiddenUi) == "Instance" then
+			table.insert(containers, hiddenUi)
+		end
+	end
+	pcall(function()
+		if CoreGui then
+			table.insert(containers, CoreGui)
+		end
+	end)
+	local lp = Players.LocalPlayer
+	if lp then
+		local pg = lp:FindFirstChildOfClass("PlayerGui")
+		if pg then
+			table.insert(containers, pg)
+		end
+	end
+
+	for _, container in ipairs(containers) do
+		for _, child in ipairs(container:GetChildren()) do
+			if child:IsA("ScreenGui") and child.Name == CONFIG.GUI_NAME then
+				pcall(function()
+					child:Destroy()
+				end)
+			end
+		end
+	end
+end
+
+-- Dọn dẹp phiên bản đang chạy trước đó (nếu người dùng chạy lại script)
+local globalEnv = getGlobalEnv()
+if type(globalEnv[CONFIG.CLEANUP_KEY]) == "function" then
+	pcall(globalEnv[CONFIG.CLEANUP_KEY])
+	globalEnv[CONFIG.CLEANUP_KEY] = nil
+end
+removeExistingGuis()
+
+--==============================================================================
+-- 2. QUẢN LÝ TRẠNG THÁI & CONNECTIONS (CHỐNG RÒ RỈ BỘ NHỚ)
+--==============================================================================
+local state = {
+	destroyed = false,
+	isLocked = false,
+	isMenuOpen = true,
+	isChecking = false,
+	autoRefresh = true,
+	activeTargetUsername = "",
+	lastManualCheckTime = 0,
+	nextAutoCheckTime = 0,
+	activeRequestId = 0,
+	connections = {},
+	screenGui = nil,
+}
+
+local function trackConnection(conn)
+	if conn then
+		table.insert(state.connections, conn)
+	end
+	return conn
+end
+
+local function cleanup()
+	if state.destroyed then
+		return
+	end
+	state.destroyed = true
+
+	for _, conn in ipairs(state.connections) do
+		pcall(function()
+			if conn.Connected then
+				conn:Disconnect()
+			end
+		end)
+	end
+	table.clear(state.connections)
+
+	if state.screenGui then
+		local guiRef = state.screenGui
+		state.screenGui = nil
+		pcall(function()
+			guiRef:Destroy()
+		end)
+	end
+
+	if globalEnv[CONFIG.CLEANUP_KEY] == cleanup then
+		globalEnv[CONFIG.CLEANUP_KEY] = nil
+	end
+end
+
+globalEnv[CONFIG.CLEANUP_KEY] = cleanup
+
+--==============================================================================
+-- 3. KIỂM TRA HTTP CAPABILITY & GỬI REQUEST AN TOÀN (KHÔNG TREO, KHÔNG GIẢ LẬP)
+--==============================================================================
+local function detectHttpRequest()
+	local candidates = {
+		function() return request end,
+		function() return http_request end,
+		function() return http and http.request end,
+		function() return syn and syn.request end,
+		function() return fluxus and fluxus.request end,
+		function() return krnl and krnl.request end,
+		function() return Delta and Delta.request end,
+	}
+
+	for _, getter in ipairs(candidates) do
+		local ok, fn = pcall(getter)
+		if ok and type(fn) == "function" then
+			return fn
+		end
+	end
+
+	return nil
+end
+
+local function safeJsonEncode(tbl)
+	local ok, encoded = pcall(function()
+		return HttpService:JSONEncode(tbl)
+	end)
+	if ok and type(encoded) == "string" then
+		return true, encoded
+	end
+	return false, nil
+end
+
+local function safeJsonDecode(raw)
+	if type(raw) ~= "string" or raw == "" then
+		return false, nil
+	end
+	local ok, decoded = pcall(function()
+		return HttpService:JSONDecode(raw)
+	end)
+	if ok and type(decoded) == "table" then
+		return true, decoded
+	end
+	return false, nil
+end
+
+local function httpRequestWithTimeout(httpFn, options, timeoutSeconds)
+	if type(httpFn) ~= "function" then
+		return false, nil, "Môi trường hiện tại không hỗ trợ hàm HTTP request (LocalScript chuẩn không thể gọi API ngoài)."
+	end
+
+	local completed = false
+	local callOk = false
+	local response = nil
+
+	local workerThread = task.spawn(function()
+		callOk, response = pcall(httpFn, options)
+		completed = true
+	end)
+
+	local elapsed = 0
+	local limit = timeoutSeconds or CONFIG.REQUEST_TIMEOUT
+	while not completed and elapsed < limit and not state.destroyed do
+		elapsed += task.wait(0.05)
+	end
+
+	if state.destroyed then
+		pcall(task.cancel, workerThread)
+		return false, nil, "Script đã được đóng."
+	end
+
+	if not completed then
+		pcall(task.cancel, workerThread)
+		return false, nil, "Hết thời gian chờ phản hồi từ API (Timeout " .. tostring(limit) .. "s)."
+	end
+
+	if not callOk then
+		return false, nil, "Lỗi khi gọi HTTP request: " .. tostring(response)
+	end
+
+	if type(response) ~= "table" then
+		return false, nil, "Phản hồi HTTP không hợp lệ từ executor."
+	end
+
+	local statusCode = tonumber(response.StatusCode)
+	if not statusCode then
+		statusCode = (response.Success == true) and 200 or 0
+	end
+
+	return true, {
+		StatusCode = statusCode,
+		Body = type(response.Body) == "string" and response.Body or "",
+	}, nil
+end
+
+--==============================================================================
+-- 4. CÁC HÀM TRUY VẤN ROBLOX PUBLIC API
+--==============================================================================
+local function formatCurrentTime()
+	return os.date("%H:%M:%S - %d/%m/%Y")
+end
+
+local function normalizeUsername(rawInput)
+	if type(rawInput) ~= "string" then
+		return ""
+	end
+	return (rawInput:match("^%s*(.-)%s*$") or "")
+end
+
+-- Bước 1: Tra cứu UserId & Display Name từ Username (users.roblox.com/v1/usernames/users)
+local function fetchUserByUsername(httpFn, username)
+	local okEncode, payload = safeJsonEncode({
+		usernames = { username },
+		excludeBannedUsers = false,
+	})
+	if not okEncode then
+		return false, nil, "Không thể mã hóa dữ liệu JSON cho Users API.", false
+	end
+
+	local okHttp, res, netErr = httpRequestWithTimeout(httpFn, {
+		Url = "https://users.roblox.com/v1/usernames/users",
+		Method = "POST",
+		Headers = {
+			["Content-Type"] = "application/json",
+			["Accept"] = "application/json",
+		},
+		Body = payload,
+	}, CONFIG.REQUEST_TIMEOUT)
+
+	if not okHttp then
+		return false, nil, netErr, false
+	end
+
+	if res.StatusCode == 429 then
+		return false, nil, "Bị giới hạn tốc độ truy vấn (HTTP 429) từ Users API.", true
+	end
+	if res.StatusCode < 200 or res.StatusCode >= 300 then
+		return false, nil, "Users API trả về lỗi HTTP " .. tostring(res.StatusCode) .. ".", false
+	end
+
+	local okDecode, decoded = safeJsonDecode(res.Body)
+	if not okDecode or type(decoded.data) ~= "table" then
+		return false, nil, "Lỗi phân tích dữ liệu JSON từ Users API.", false
+	end
+
+	local userData = decoded.data[1]
+	if type(userData) ~= "table" or type(userData.id) ~= "number" then
+		return false, nil, "Không tìm thấy người chơi với username \"" .. username .. "\".", false
+	end
+
+	return true, {
+		id = userData.id,
+		name = type(userData.name) == "string" and userData.name or username,
+		displayName = type(userData.displayName) == "string" and userData.displayName or (type(userData.name) == "string" and userData.name or username),
+	}, nil, false
+end
+
+-- Bước 2: Kiểm tra trạng thái Online/Offline/InGame (presence.roblox.com/v1/presence/users)
+local function fetchUserPresence(httpFn, userId)
+	local okEncode, payload = safeJsonEncode({
+		userIds = { userId },
+	})
+	if not okEncode then
+		return false, nil, "Không thể mã hóa dữ liệu JSON cho Presence API.", false
+	end
+
+	local okHttp, res, netErr = httpRequestWithTimeout(httpFn, {
+		Url = "https://presence.roblox.com/v1/presence/users",
+		Method = "POST",
+		Headers = {
+			["Content-Type"] = "application/json",
+			["Accept"] = "application/json",
+		},
+		Body = payload,
+	}, CONFIG.REQUEST_TIMEOUT)
+
+	if not okHttp then
+		return false, nil, netErr, false
+	end
+
+	if res.StatusCode == 429 then
+		return false, nil, "Bị giới hạn tốc độ truy vấn (HTTP 429) từ Presence API.", true
+	end
+	if res.StatusCode < 200 or res.StatusCode >= 300 then
+		return false, nil, "Presence API trả về lỗi HTTP " .. tostring(res.StatusCode) .. ".", false
+	end
+
+	local okDecode, decoded = safeJsonDecode(res.Body)
+	if not okDecode or type(decoded.userPresences) ~= "table" then
+		return false, nil, "Lỗi phân tích dữ liệu JSON từ Presence API.", false
+	end
+
+	local presence = decoded.userPresences[1]
+	if type(presence) ~= "table" then
+		return false, nil, "Presence API không trả về dữ liệu trạng thái cho UserId này.", false
+	end
+
+	return true, presence, nil, false
+end
+
+-- Bước 3 phụ (nếu có placeId nhưng thiếu universeId): Lấy universeId từ placeId
+local function fetchUniverseIdFromPlace(httpFn, placeId)
+	local url = string.format("https://apis.roblox.com/universes/v1/places/%d/universe", placeId)
+	local okHttp, res, netErr = httpRequestWithTimeout(httpFn, {
+		Url = url,
+		Method = "GET",
+		Headers = {
+			["Accept"] = "application/json",
+		},
+	}, CONFIG.REQUEST_TIMEOUT)
+
+	if not okHttp then
+		return nil, netErr, false
+	end
+	if res.StatusCode == 429 then
+		return nil, "HTTP 429 từ Universes API.", true
+	end
+	if res.StatusCode < 200 or res.StatusCode >= 300 then
+		return nil, "Universes API trả về HTTP " .. tostring(res.StatusCode), false
+	end
+
+	local okDecode, decoded = safeJsonDecode(res.Body)
+	if okDecode and type(decoded.universeId) == "number" and decoded.universeId > 0 then
+		return decoded.universeId, nil, false
+	end
+	return nil, "Không lấy được universeId từ placeId.", false
+end
+
+-- Bước 3 chính: Lấy tên Experience từ universeId (games.roblox.com/v1/games)
+local function fetchGameNameByUniverseId(httpFn, universeId)
+	local url = string.format("https://games.roblox.com/v1/games?universeIds=%d", universeId)
+	local okHttp, res, netErr = httpRequestWithTimeout(httpFn, {
+		Url = url,
+		Method = "GET",
+		Headers = {
+			["Accept"] = "application/json",
+		},
+	}, CONFIG.REQUEST_TIMEOUT)
+
+	if not okHttp then
+		return false, nil, netErr, false
+	end
+	if res.StatusCode == 429 then
+		return false, nil, "Bị giới hạn tốc độ truy vấn (HTTP 429) từ Games API.", true
+	end
+	if res.StatusCode < 200 or res.StatusCode >= 300 then
+		return false, nil, "Games API trả về lỗi HTTP " .. tostring(res.StatusCode) .. ".", false
+	end
+
+	local okDecode, decoded = safeJsonDecode(res.Body)
+	if not okDecode or type(decoded.data) ~= "table" then
+		return false, nil, "Lỗi phân tích dữ liệu JSON từ Games API.", false
+	end
+
+	local gameInfo = decoded.data[1]
+	if type(gameInfo) == "table" and type(gameInfo.name) == "string" and gameInfo.name ~= "" then
+		return true, gameInfo.name, nil, false
+	end
+
+	return false, nil, "Games API không trả về tên experience.", false
+end
+
+-- Tổng hợp toàn bộ quy trình kiểm tra người chơi
+local function resolvePlayerStatus(rawUsername)
+	local timestamp = formatCurrentTime()
+	local username = normalizeUsername(rawUsername)
+
+	if username == "" then
+		return {
+			username = "Chưa nhập",
+			displayName = "Không xác định được",
+			userIdText = "Không xác định được",
+			status = "UNKNOWN",
+			experience = "Không xác định được",
+			lastCheck = timestamp,
+			errorMessage = "Vui lòng nhập username Roblox cần kiểm tra.",
+			rateLimited = false,
+			shouldStopAuto = true,
+		}
+	end
+
+	if username:find("[%c%s]") then
+		return {
+			username = username,
+			displayName = "Không xác định được",
+			userIdText = "Không xác định được",
+			status = "UNKNOWN",
+			experience = "Không xác định được",
+			lastCheck = timestamp,
+			errorMessage = "Username không hợp lệ (không được chứa khoảng trắng hoặc ký tự điều khiển).",
+			rateLimited = false,
+			shouldStopAuto = true,
+		}
+	end
+
+	local httpFn = detectHttpRequest()
+	if not httpFn then
+		return {
+			username = username,
+			displayName = "Không xác định được",
+			userIdText = "Không xác định được",
+			status = "UNKNOWN",
+			experience = "Không xác định được",
+			lastCheck = timestamp,
+			errorMessage = "Môi trường hiện tại không hỗ trợ HTTP request (thiếu request / http_request / syn.request; LocalScript chuẩn của Roblox không thể gọi HTTP API).",
+			rateLimited = false,
+			shouldStopAuto = true,
+		}
+	end
+
+	-- 1. Lookup UserId & DisplayName
+	local okUser, userInfo, userErr, userRateLimited = fetchUserByUsername(httpFn, username)
+	if not okUser or not userInfo then
+		local notFound = type(userErr) == "string" and userErr:find("Không tìm thấy người chơi", 1, true) ~= nil
+		return {
+			username = username,
+			displayName = "Không xác định được",
+			userIdText = "Không xác định được",
+			status = "UNKNOWN",
+			experience = "Không xác định được",
+			lastCheck = timestamp,
+			errorMessage = userErr or "Không lấy được dữ liệu người chơi.",
+			rateLimited = userRateLimited,
+			shouldStopAuto = notFound,
+		}
+	end
+
+	-- 2. Lookup Presence
+	local okPresence, presence, presErr, presRateLimited = fetchUserPresence(httpFn, userInfo.id)
+	if not okPresence or not presence then
+		return {
+			username = userInfo.name,
+			displayName = userInfo.displayName,
+			userIdText = tostring(userInfo.id),
+			status = "UNKNOWN",
+			experience = "Không xác định được",
+			lastCheck = timestamp,
+			errorMessage = presErr or "Không lấy được dữ liệu trạng thái từ Presence API.",
+			rateLimited = presRateLimited,
+		}
+	end
+
+	local presenceType = tonumber(presence.userPresenceType)
+	local universeId = (type(presence.universeId) == "number" and presence.universeId > 0) and presence.universeId or nil
+	local placeId = (type(presence.placeId) == "number" and presence.placeId > 0) and presence.placeId or nil
+	if not placeId and type(presence.rootPlaceId) == "number" and presence.rootPlaceId > 0 then
+		placeId = presence.rootPlaceId
+	end
+
+	if presenceType == 0 then
+		return {
+			username = userInfo.name,
+			displayName = userInfo.displayName,
+			userIdText = tostring(userInfo.id),
+			status = "OFFLINE",
+			experience = "Không ở trong game (Offline)",
+			lastCheck = timestamp,
+			errorMessage = nil,
+			rateLimited = false,
+		}
+	elseif presenceType == 4 then
+		return {
+			username = userInfo.name,
+			displayName = userInfo.displayName,
+			userIdText = tostring(userInfo.id),
+			status = "OFFLINE",
+			experience = "Không xác định được (Người chơi đang bật ẩn trạng thái)",
+			lastCheck = timestamp,
+			errorMessage = nil,
+			rateLimited = false,
+		}
+	elseif presenceType == 1 then
+		return {
+			username = userInfo.name,
+			displayName = userInfo.displayName,
+			userIdText = tostring(userInfo.id),
+			status = "ONLINE",
+			experience = "ONLINE (Đang trực tuyến, không ở trong game)",
+			lastCheck = timestamp,
+			errorMessage = nil,
+			rateLimited = false,
+		}
+	elseif presenceType == 2 or presenceType == 3 then
+		local inStudio = (presenceType == 3)
+
+		-- Thử suy ra universeId từ placeId nếu Presence API chỉ trả về placeId
+		if not universeId and placeId then
+			local resolvedUniverseId, _, uniRateLimited = fetchUniverseIdFromPlace(httpFn, placeId)
+			if resolvedUniverseId then
+				universeId = resolvedUniverseId
+			elseif uniRateLimited then
+				return {
+					username = userInfo.name,
+					displayName = userInfo.displayName,
+					userIdText = tostring(userInfo.id),
+					status = "ONLINE",
+					experience = "Không xác định được (Bị giới hạn request khi tra cứu game)",
+					lastCheck = timestamp,
+					errorMessage = "Bị giới hạn tốc độ truy vấn (HTTP 429) khi tra cứu universeId.",
+					rateLimited = true,
+				}
+			end
+		end
+
+		if universeId then
+			local okGame, gameName, gameErr, gameRateLimited = fetchGameNameByUniverseId(httpFn, universeId)
+			if okGame and gameName then
+				local formattedExp = inStudio and (gameName .. " (Roblox Studio)") or gameName
+				return {
+					username = userInfo.name,
+					displayName = userInfo.displayName,
+					userIdText = tostring(userInfo.id),
+					status = "ONLINE",
+					experience = formattedExp,
+					lastCheck = timestamp,
+					errorMessage = nil,
+					rateLimited = false,
+				}
+			else
+				return {
+					username = userInfo.name,
+					displayName = userInfo.displayName,
+					userIdText = tostring(userInfo.id),
+					status = "ONLINE",
+					experience = "Không xác định được",
+					lastCheck = timestamp,
+					errorMessage = gameErr or "Không lấy được tên experience từ Games API.",
+					rateLimited = gameRateLimited,
+				}
+			end
+		else
+			-- Trường hợp phổ biến khi gọi Presence API không xác thực hoặc user tắt quyền hiển thị game
+			local label = inStudio
+				and "Đang trong Roblox Studio (API không trả về universeId)"
+				or "Không xác định được (Đang trong game nhưng Roblox ẩn universeId khi không xác thực hoặc theo cài đặt riêng tư)"
+			return {
+				username = userInfo.name,
+				displayName = userInfo.displayName,
+				userIdText = tostring(userInfo.id),
+				status = "ONLINE",
+				experience = label,
+				lastCheck = timestamp,
+				errorMessage = nil,
+				rateLimited = false,
+			}
+		end
+	else
+		return {
+			username = userInfo.name,
+			displayName = userInfo.displayName,
+			userIdText = tostring(userInfo.id),
+			status = "UNKNOWN",
+			experience = "Không xác định được",
+			lastCheck = timestamp,
+			errorMessage = "Presence API trả về mã trạng thái không xác định (" .. tostring(presence.userPresenceType) .. ").",
+			rateLimited = false,
+		}
+	end
+end
+
+--==============================================================================
+-- 5. TIỆN ÍCH GIAO DIỆN & KÉO THẢ CẢM ỨNG (MOBILE + PC)
+--==============================================================================
+local function getViewportSize()
+	local cam = workspace.CurrentCamera
+	if cam and cam.ViewportSize and cam.ViewportSize.X > 0 and cam.ViewportSize.Y > 0 then
+		return cam.ViewportSize
+	end
+	return Vector2.new(800, 480)
+end
+
+local function clampPositionToScreen(posX, posY, elemWidth, elemHeight, margin)
+	local vp = getViewportSize()
+	local m = margin or CONFIG.SCREEN_MARGIN
+	local maxX = math.max(m, vp.X - elemWidth - m)
+	local maxY = math.max(m, vp.Y - elemHeight - m)
+	return math.clamp(posX, m, maxX), math.clamp(posY, m, maxY)
+end
+
+local function applyCorner(instance, radius)
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = radius
+	corner.Parent = instance
+	return corner
+end
+
+local function applyStroke(instance, color, thickness, transparency)
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = color
+	stroke.Thickness = thickness or 1
+	stroke.Transparency = transparency or 0
+	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	stroke.Parent = instance
+	return stroke
+end
+
+local function applyPadding(instance, top, right, bottom, left)
+	local pad = Instance.new("UIPadding")
+	pad.PaddingTop = UDim.new(0, top)
+	pad.PaddingRight = UDim.new(0, right)
+	pad.PaddingBottom = UDim.new(0, bottom)
+	pad.PaddingLeft = UDim.new(0, left)
+	pad.Parent = instance
+	return pad
+end
+
+--[[
+	Gắn kéo thả hỗ trợ cả Touch (Android) và Mouse (PC).
+	Đặc biệt: Khi `canDrag()` trả về false (đã khóa), thao tác nhấn `onTap()`
+	vẫn luôn hoạt động bình thường và không bao giờ bị chặn.
+]]
+local function bindDragAndTap(handle, targetFrame, options)
+	local activeInput = nil
+	local activeInputType = nil
+	local dragStartMouse = Vector2.zero
+	local dragStartPos = Vector2.zero
+	local movedBeyondThreshold = false
+
+	trackConnection(handle.InputBegan:Connect(function(input)
+		if state.destroyed then
+			return
+		end
+		local inputType = input.UserInputType
+		if inputType ~= Enum.UserInputType.MouseButton1 and inputType ~= Enum.UserInputType.Touch then
+			return
+		end
+		if activeInput ~= nil then
+			return
+		end
+
+		activeInput = input
+		activeInputType = inputType
+		dragStartMouse = Vector2.new(input.Position.X, input.Position.Y)
+		dragStartPos = Vector2.new(targetFrame.AbsolutePosition.X, targetFrame.AbsolutePosition.Y)
+		movedBeyondThreshold = false
+	end))
+
+	trackConnection(UserInputService.InputChanged:Connect(function(input)
+		if state.destroyed or activeInput == nil then
+			return
+		end
+
+		local isMatchingMove = (activeInputType == Enum.UserInputType.Touch and input == activeInput)
+			or (activeInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement)
+
+		if not isMatchingMove then
+			return
+		end
+
+		local allowDrag = (type(options.canDrag) == "function") and options.canDrag() or true
+		if not allowDrag then
+			-- Đã khóa: giữ nguyên vị trí, không đánh dấu là đã kéo để tap mở menu luôn nhạy
+			return
+		end
+
+		local currentPos = Vector2.new(input.Position.X, input.Position.Y)
+		local delta = currentPos - dragStartMouse
+		if delta.Magnitude >= CONFIG.DRAG_THRESHOLD then
+			movedBeyondThreshold = true
+		end
+
+		if movedBeyondThreshold then
+			local targetSize = targetFrame.AbsoluteSize
+			local clampedX, clampedY = clampPositionToScreen(
+				dragStartPos.X + delta.X,
+				dragStartPos.Y + delta.Y,
+				targetSize.X,
+				targetSize.Y,
+				CONFIG.SCREEN_MARGIN
+			)
+			targetFrame.Position = UDim2.fromOffset(clampedX, clampedY)
+		end
+	end))
+
+	trackConnection(UserInputService.InputEnded:Connect(function(input)
+		if state.destroyed or activeInput == nil then
+			return
+		end
+
+		local isMatchingEnd = (activeInputType == Enum.UserInputType.Touch and input == activeInput)
+			or (activeInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseButton1)
+
+		if not isMatchingEnd then
+			return
+		end
+
+		local wasTap = not movedBeyondThreshold
+		activeInput = nil
+		activeInputType = nil
+		movedBeyondThreshold = false
+
+		if wasTap and type(options.onTap) == "function" then
+			options.onTap()
+		end
+	end))
+end
+
+--==============================================================================
+-- 6. XÂY DỰNG GIAO DIỆN MOBILE HIỆN ĐẠI
+--==============================================================================
+local uiRefs = {}
+
+local function buildUI()
+	local guiParent = getPreferredGuiParent()
+	if not guiParent then
+		warn("[Player Status Tracker] Không tìm thấy thư mục gắn giao diện (gethui / CoreGui / PlayerGui).")
+		return false
+	end
+
+	local screenGui = Instance.new("ScreenGui")
+	screenGui.Name = CONFIG.GUI_NAME
+	screenGui.ResetOnSpawn = false
+	screenGui.IgnoreGuiInset = true
+	screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	screenGui.DisplayOrder = 999999
+	screenGui.Parent = guiParent
+	state.screenGui = screenGui
+
+	trackConnection(screenGui.Destroying:Connect(function()
+		cleanup()
+	end))
+
+	local vp = getViewportSize()
+
+	-- --------------------------------------------------------------------------
+	-- A. CỤM NÚT NỔI (FLOATING BUTTON) + NÚT KHÓA (LOCK BUTTON) BÊN CẠNH
+	-- --------------------------------------------------------------------------
+	local floatingTotalWidth = CONFIG.FLOATING_BTN_SIZE + 8 + CONFIG.LOCK_BTN_SIZE
+	local floatingTotalHeight = CONFIG.FLOATING_BTN_SIZE + 2
+	local initFloatX, initFloatY = clampPositionToScreen(16, math.floor(vp.Y * 0.36), floatingTotalWidth, floatingTotalHeight, CONFIG.SCREEN_MARGIN)
+
+	local floatingContainer = Instance.new("Frame")
+	floatingContainer.Name = "FloatingContainer"
+	floatingContainer.Size = UDim2.fromOffset(floatingTotalWidth, floatingTotalHeight)
+	floatingContainer.Position = UDim2.fromOffset(initFloatX, initFloatY)
+	floatingContainer.BackgroundTransparency = 1
+	floatingContainer.ZIndex = 20
+	floatingContainer.Parent = screenGui
+
+	-- Nút nổi hình tròn (~52px)
+	local floatingButton = Instance.new("TextButton")
+	floatingButton.Name = "FloatingToggleButton"
+	floatingButton.Size = UDim2.fromOffset(CONFIG.FLOATING_BTN_SIZE, CONFIG.FLOATING_BTN_SIZE)
+	floatingButton.Position = UDim2.fromOffset(0, 1)
+	floatingButton.BackgroundColor3 = COLORS.BG_MAIN
+	floatingButton.Text = ""
+	floatingButton.AutoButtonColor = false
+	floatingButton.ZIndex = 21
+	floatingButton.Parent = floatingContainer
+	applyCorner(floatingButton, UDim.new(1, 0))
+	local floatStroke = applyStroke(floatingButton, COLORS.ACCENT, 2, 0.1)
+
+	local floatInnerRing = Instance.new("Frame")
+	floatInnerRing.Name = "InnerRing"
+	floatInnerRing.Size = UDim2.fromOffset(38, 38)
+	floatInnerRing.Position = UDim2.fromScale(0.5, 0.5)
+	floatInnerRing.AnchorPoint = Vector2.new(0.5, 0.5)
+	floatInnerRing.BackgroundColor3 = COLORS.BG_PANEL
+	floatInnerRing.ZIndex = 22
+	floatInnerRing.Parent = floatingButton
+	applyCorner(floatInnerRing, UDim.new(1, 0))
+	applyStroke(floatInnerRing, COLORS.ACCENT, 1, 0.55)
+
+	local floatLabel = Instance.new("TextLabel")
+	floatLabel.Name = "BadgeText"
+	floatLabel.Size = UDim2.fromScale(1, 1)
+	floatLabel.BackgroundTransparency = 1
+	floatLabel.Text = "PST"
+	floatLabel.TextColor3 = COLORS.TEXT_PRIMARY
+	floatLabel.Font = Enum.Font.GothamBold
+	floatLabel.TextSize = 13
+	floatLabel.ZIndex = 23
+	floatLabel.Parent = floatInnerRing
+
+	local floatStatusDot = Instance.new("Frame")
+	floatStatusDot.Name = "StatusDot"
+	floatStatusDot.Size = UDim2.fromOffset(10, 10)
+	floatStatusDot.Position = UDim2.new(1, -11, 0, 1)
+	floatStatusDot.BackgroundColor3 = COLORS.ACCENT
+	floatStatusDot.ZIndex = 24
+	floatStatusDot.Parent = floatingButton
+	applyCorner(floatStatusDot, UDim.new(1, 0))
+	applyStroke(floatStatusDot, COLORS.BG_MAIN, 2, 0)
+
+	-- Nút khóa vị trí đặt bên cạnh nút nổi (không che nút nổi)
+	local lockButton = Instance.new("TextButton")
+	lockButton.Name = "LockPositionButton"
+	lockButton.Size = UDim2.fromOffset(CONFIG.LOCK_BTN_SIZE, CONFIG.LOCK_BTN_SIZE)
+	lockButton.Position = UDim2.fromOffset(CONFIG.FLOATING_BTN_SIZE + 8, math.floor((floatingTotalHeight - CONFIG.LOCK_BTN_SIZE) / 2))
+	lockButton.BackgroundColor3 = COLORS.BG_PANEL
+	lockButton.Text = ""
+	lockButton.AutoButtonColor = false
+	lockButton.ZIndex = 21
+	lockButton.Parent = floatingContainer
+	applyCorner(lockButton, UDim.new(0, 10))
+	local lockStroke = applyStroke(lockButton, COLORS.UNLOCKED, 1.5, 0.15)
+
+	-- Vẽ biểu tượng ổ khóa bằng Frame để hiển thị sắc nét trên mọi thiết bị Android
+	local lockIconHolder = Instance.new("Frame")
+	lockIconHolder.Name = "LockIcon"
+	lockIconHolder.Size = UDim2.fromOffset(18, 20)
+	lockIconHolder.Position = UDim2.fromScale(0.5, 0.5)
+	lockIconHolder.AnchorPoint = Vector2.new(0.5, 0.5)
+	lockIconHolder.BackgroundTransparency = 1
+	lockIconHolder.ZIndex = 22
+	lockIconHolder.Parent = lockButton
+
+	local lockShackle = Instance.new("Frame")
+	lockShackle.Name = "Shackle"
+	lockShackle.Size = UDim2.fromOffset(10, 9)
+	lockShackle.Position = UDim2.fromOffset(4, 1)
+	lockShackle.BackgroundTransparency = 1
+	lockShackle.ZIndex = 22
+	lockShackle.Parent = lockIconHolder
+	applyCorner(lockShackle, UDim.new(1, 0))
+	local shackleStroke = applyStroke(lockShackle, COLORS.UNLOCKED, 2, 0)
+
+	local lockBody = Instance.new("Frame")
+	lockBody.Name = "Body"
+	lockBody.Size = UDim2.fromOffset(14, 10)
+	lockBody.Position = UDim2.fromOffset(2, 9)
+	lockBody.BackgroundColor3 = COLORS.UNLOCKED
+	lockBody.ZIndex = 23
+	lockBody.Parent = lockIconHolder
+	applyCorner(lockBody, UDim.new(0, 3))
+
+	local lockKeyhole = Instance.new("Frame")
+	lockKeyhole.Name = "Keyhole"
+	lockKeyhole.Size = UDim2.fromOffset(3, 4)
+	lockKeyhole.Position = UDim2.fromScale(0.5, 0.5)
+	lockKeyhole.AnchorPoint = Vector2.new(0.5, 0.5)
+	lockKeyhole.BackgroundColor3 = COLORS.BG_PANEL
+	lockKeyhole.ZIndex = 24
+	lockKeyhole.Parent = lockBody
+	applyCorner(lockKeyhole, UDim.new(1, 0))
+
+	-- --------------------------------------------------------------------------
+	-- B. GIAO DIỆN CHÍNH (MAIN PANEL - RESPONSIVE CHO ĐIỆN THOẠI)
+	-- --------------------------------------------------------------------------
+	local panelW = math.clamp(vp.X - 24, 260, 380)
+	local panelH = math.clamp(vp.Y - 36, 300, 468)
+	local initPanelX, initPanelY = clampPositionToScreen(
+		math.floor((vp.X - panelW) / 2),
+		math.floor((vp.Y - panelH) / 2),
+		panelW,
+		panelH,
+		CONFIG.SCREEN_MARGIN
+	)
+
+	local mainPanel = Instance.new("Frame")
+	mainPanel.Name = "MainPanel"
+	mainPanel.Size = UDim2.fromOffset(panelW, panelH)
+	mainPanel.Position = UDim2.fromOffset(initPanelX, initPanelY)
+	mainPanel.BackgroundColor3 = COLORS.BG_MAIN
+	mainPanel.Visible = state.isMenuOpen
+	mainPanel.ClipsDescendants = true
+	mainPanel.ZIndex = 10
+	mainPanel.Parent = screenGui
+	applyCorner(mainPanel, UDim.new(0, 14))
+	applyStroke(mainPanel, COLORS.BORDER, 1.5, 0)
+
+	-- Thanh tiêu đề (kéo bảng + nút X đóng)
+	local titleBar = Instance.new("Frame")
+	titleBar.Name = "TitleBar"
+	titleBar.Size = UDim2.new(1, 0, 0, 46)
+	titleBar.BackgroundColor3 = COLORS.BG_PANEL
+	titleBar.ZIndex = 11
+	titleBar.Parent = mainPanel
+
+	local titleDivider = Instance.new("Frame")
+	titleDivider.Size = UDim2.new(1, 0, 0, 1)
+	titleDivider.Position = UDim2.new(0, 0, 1, -1)
+	titleDivider.BackgroundColor3 = COLORS.BORDER
+	titleDivider.BorderSizePixel = 0
+	titleDivider.ZIndex = 12
+	titleDivider.Parent = titleBar
+
+	local titleDot = Instance.new("Frame")
+	titleDot.Size = UDim2.fromOffset(10, 10)
+	titleDot.Position = UDim2.new(0, 14, 0.5, 0)
+	titleDot.AnchorPoint = Vector2.new(0, 0.5)
+	titleDot.BackgroundColor3 = COLORS.ACCENT
+	titleDot.ZIndex = 12
+	titleDot.Parent = titleBar
+	applyCorner(titleDot, UDim.new(1, 0))
+
+	local titleText = Instance.new("TextLabel")
+	titleText.Name = "TitleText"
+	titleText.Size = UDim2.new(1, -76, 1, 0)
+	titleText.Position = UDim2.fromOffset(32, 0)
+	titleText.BackgroundTransparency = 1
+	titleText.Text = "Player Status Tracker"
+	titleText.TextColor3 = COLORS.TEXT_PRIMARY
+	titleText.Font = Enum.Font.GothamBold
+	titleText.TextSize = 15
+	titleText.TextXAlignment = Enum.TextXAlignment.Left
+	titleText.ZIndex = 12
+	titleText.Parent = titleBar
+
+	local closeButton = Instance.new("TextButton")
+	closeButton.Name = "CloseButton"
+	closeButton.Size = UDim2.fromOffset(34, 34)
+	closeButton.Position = UDim2.new(1, -40, 0.5, 0)
+	closeButton.AnchorPoint = Vector2.new(0, 0.5)
+	closeButton.BackgroundColor3 = COLORS.BG_INPUT
+	closeButton.Text = "X"
+	closeButton.TextColor3 = COLORS.TEXT_PRIMARY
+	closeButton.Font = Enum.Font.GothamBold
+	closeButton.TextSize = 15
+	closeButton.AutoButtonColor = false
+	closeButton.ZIndex = 13
+	closeButton.Parent = titleBar
+	applyCorner(closeButton, UDim.new(0, 8))
+	applyStroke(closeButton, COLORS.BORDER, 1, 0.2)
+
+	-- Thân giao diện chính
+	local bodyFrame = Instance.new("Frame")
+	bodyFrame.Name = "BodyFrame"
+	bodyFrame.Size = UDim2.new(1, 0, 1, -46)
+	bodyFrame.Position = UDim2.fromOffset(0, 46)
+	bodyFrame.BackgroundTransparency = 1
+	bodyFrame.ZIndex = 11
+	bodyFrame.Parent = mainPanel
+	applyPadding(bodyFrame, 12, 12, 12, 12)
+
+	-- Ô nhập username
+	local usernameBox = Instance.new("TextBox")
+	usernameBox.Name = "UsernameInput"
+	usernameBox.Size = UDim2.new(1, 0, 0, 44)
+	usernameBox.Position = UDim2.fromOffset(0, 0)
+	usernameBox.BackgroundColor3 = COLORS.BG_INPUT
+	usernameBox.Text = ""
+	usernameBox.PlaceholderText = "Nhập username Roblox..."
+	usernameBox.PlaceholderColor3 = COLORS.TEXT_MUTED
+	usernameBox.TextColor3 = COLORS.TEXT_PRIMARY
+	usernameBox.Font = Enum.Font.GothamMedium
+	usernameBox.TextSize = 15
+	usernameBox.ClearTextOnFocus = false
+	usernameBox.TextXAlignment = Enum.TextXAlignment.Left
+	usernameBox.ZIndex = 12
+	usernameBox.Parent = bodyFrame
+	applyCorner(usernameBox, UDim.new(0, 10))
+	applyStroke(usernameBox, COLORS.BORDER, 1, 0)
+	applyPadding(usernameBox, 0, 12, 0, 12)
+
+	-- Hàng nút điều khiển (CHECK + AUTO)
+	local actionRow = Instance.new("Frame")
+	actionRow.Name = "ActionRow"
+	actionRow.Size = UDim2.new(1, 0, 0, 44)
+	actionRow.Position = UDim2.fromOffset(0, 52)
+	actionRow.BackgroundTransparency = 1
+	actionRow.ZIndex = 12
+	actionRow.Parent = bodyFrame
+
+	local checkButton = Instance.new("TextButton")
+	checkButton.Name = "CheckButton"
+	checkButton.Size = UDim2.new(0.65, -4, 1, 0)
+	checkButton.Position = UDim2.fromScale(0, 0)
+	checkButton.BackgroundColor3 = COLORS.ACCENT
+	checkButton.Text = "CHECK"
+	checkButton.TextColor3 = COLORS.BG_MAIN
+	checkButton.Font = Enum.Font.GothamBold
+	checkButton.TextSize = 15
+	checkButton.AutoButtonColor = false
+	checkButton.ZIndex = 13
+	checkButton.Parent = actionRow
+	applyCorner(checkButton, UDim.new(0, 10))
+
+	local autoButton = Instance.new("TextButton")
+	autoButton.Name = "AutoRefreshButton"
+	autoButton.Size = UDim2.new(0.35, -4, 1, 0)
+	autoButton.Position = UDim2.new(0.65, 4, 0, 0)
+	autoButton.BackgroundColor3 = COLORS.BG_PANEL
+	autoButton.Text = "AUTO: ON"
+	autoButton.TextColor3 = COLORS.ONLINE
+	autoButton.Font = Enum.Font.GothamBold
+	autoButton.TextSize = 12
+	autoButton.AutoButtonColor = false
+	autoButton.ZIndex = 13
+	autoButton.Parent = actionRow
+	applyCorner(autoButton, UDim.new(0, 10))
+	local autoStroke = applyStroke(autoButton, COLORS.ONLINE, 1.2, 0.35)
+
+	-- Thanh trạng thái LOADING / ERROR / AUTO COUNTDOWN
+	local statusBanner = Instance.new("Frame")
+	statusBanner.Name = "StatusBanner"
+	statusBanner.Size = UDim2.new(1, 0, 0, 34)
+	statusBanner.Position = UDim2.fromOffset(0, 104)
+	statusBanner.BackgroundColor3 = COLORS.BG_CARD
+	statusBanner.ZIndex = 12
+	statusBanner.Parent = bodyFrame
+	applyCorner(statusBanner, UDim.new(0, 8))
+	local bannerStroke = applyStroke(statusBanner, COLORS.BORDER, 1, 0.2)
+
+	local bannerText = Instance.new("TextLabel")
+	bannerText.Name = "BannerText"
+	bannerText.Size = UDim2.new(1, -16, 1, 0)
+	bannerText.Position = UDim2.fromOffset(8, 0)
+	bannerText.BackgroundTransparency = 1
+	bannerText.Text = "Sẵn sàng. Nhập username và nhấn CHECK."
+	bannerText.TextColor3 = COLORS.TEXT_SECONDARY
+	bannerText.Font = Enum.Font.GothamMedium
+	bannerText.TextSize = 12
+	bannerText.TextXAlignment = Enum.TextXAlignment.Left
+	bannerText.TextTruncate = Enum.TextTruncate.AtEnd
+	bannerText.ZIndex = 13
+	bannerText.Parent = statusBanner
+
+	-- Khu vực hiển thị kết quả (cuộn mượt trên màn hình điện thoại nhỏ)
+	local resultScroll = Instance.new("ScrollingFrame")
+	resultScroll.Name = "ResultScroll"
+	resultScroll.Size = UDim2.new(1, 0, 1, -146)
+	resultScroll.Position = UDim2.fromOffset(0, 146)
+	resultScroll.BackgroundColor3 = COLORS.BG_CARD
+	resultScroll.BorderSizePixel = 0
+	resultScroll.ScrollBarThickness = 4
+	resultScroll.ScrollBarImageColor3 = COLORS.BORDER
+	resultScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+	resultScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	resultScroll.ScrollingEnabled = true
+	resultScroll.ZIndex = 12
+	resultScroll.Parent = bodyFrame
+	applyCorner(resultScroll, UDim.new(0, 10))
+	applyStroke(resultScroll, COLORS.BORDER, 1, 0.1)
+	applyPadding(resultScroll, 12, 12, 12, 12)
+
+	local resultLayout = Instance.new("UIListLayout")
+	resultLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	resultLayout.Padding = UDim.new(0, 6)
+	resultLayout.Parent = resultScroll
+
+	local function createResultLine(name, text, color, font, size, order)
+		local lbl = Instance.new("TextLabel")
+		lbl.Name = name
+		lbl.Size = UDim2.new(1, 0, 0, 0)
+		lbl.AutomaticSize = Enum.AutomaticSize.Y
+		lbl.BackgroundTransparency = 1
+		lbl.Text = text
+		lbl.TextColor3 = color
+		lbl.Font = font
+		lbl.TextSize = size
+		lbl.TextWrapped = true
+		lbl.TextXAlignment = Enum.TextXAlignment.Left
+		lbl.TextYAlignment = Enum.TextYAlignment.Top
+		lbl.LayoutOrder = order
+		lbl.ZIndex = 13
+		lbl.Parent = resultScroll
+		return lbl
+	end
+
+	createResultLine("HeaderLabel", "PLAYER INFORMATION", COLORS.ACCENT, Enum.Font.GothamBold, 13, 1)
+
+	local dividerLine = Instance.new("Frame")
+	dividerLine.Name = "Divider"
+	dividerLine.Size = UDim2.new(1, 0, 0, 1)
+	dividerLine.BackgroundColor3 = COLORS.BORDER
+	dividerLine.BorderSizePixel = 0
+	dividerLine.LayoutOrder = 2
+	dividerLine.ZIndex = 13
+	dividerLine.Parent = resultScroll
+
+	local usernameLine = createResultLine("UsernameLine", "Username: -", COLORS.TEXT_PRIMARY, Enum.Font.GothamMedium, 13, 3)
+	local displayNameLine = createResultLine("DisplayNameLine", "Display Name: -", COLORS.TEXT_PRIMARY, Enum.Font.GothamMedium, 13, 4)
+	local userIdLine = createResultLine("UserIdLine", "UserId: -", COLORS.TEXT_PRIMARY, Enum.Font.GothamMedium, 13, 5)
+	local statusLine = createResultLine("StatusLine", "STATUS: UNKNOWN", COLORS.UNKNOWN, Enum.Font.GothamBold, 14, 6)
+
+	createResultLine("ExpTitleLine", "CURRENT EXPERIENCE:", COLORS.TEXT_SECONDARY, Enum.Font.GothamBold, 12, 7)
+	local expValueLine = createResultLine("ExpValueLine", "Không xác định được.", COLORS.TEXT_PRIMARY, Enum.Font.GothamMedium, 13, 8)
+
+	createResultLine("LastCheckTitleLine", "LAST CHECK:", COLORS.TEXT_SECONDARY, Enum.Font.GothamBold, 12, 9)
+	local lastCheckValueLine = createResultLine("LastCheckValueLine", "-", COLORS.TEXT_PRIMARY, Enum.Font.GothamMedium, 13, 10)
+
+	local errorDetailLine = createResultLine("ErrorDetailLine", "", COLORS.OFFLINE, Enum.Font.GothamMedium, 12, 11)
+	errorDetailLine.Visible = false
+
+	uiRefs = {
+		screenGui = screenGui,
+		floatingContainer = floatingContainer,
+		floatingButton = floatingButton,
+		floatStroke = floatStroke,
+		floatStatusDot = floatStatusDot,
+		lockButton = lockButton,
+		lockStroke = lockStroke,
+		lockShackle = lockShackle,
+		shackleStroke = shackleStroke,
+		lockBody = lockBody,
+		mainPanel = mainPanel,
+		titleBar = titleBar,
+		closeButton = closeButton,
+		usernameBox = usernameBox,
+		checkButton = checkButton,
+		autoButton = autoButton,
+		autoStroke = autoStroke,
+		bannerStroke = bannerStroke,
+		bannerText = bannerText,
+		usernameLine = usernameLine,
+		displayNameLine = displayNameLine,
+		userIdLine = userIdLine,
+		statusLine = statusLine,
+		expValueLine = expValueLine,
+		lastCheckValueLine = lastCheckValueLine,
+		errorDetailLine = errorDetailLine,
+	}
+
+	return true
+end
+
+--==============================================================================
+-- 7. LOGIC CẬP NHẬT GIAO DIỆN, TƯƠNG TÁC & AUTO-REFRESH LIÊN TỤC
+--==============================================================================
+local function updateLockVisuals()
+	if state.destroyed or not uiRefs.lockButton then
+		return
+	end
+	if state.isLocked then
+		uiRefs.lockStroke.Color = COLORS.LOCKED
+		uiRefs.shackleStroke.Color = COLORS.LOCKED
+		uiRefs.lockBody.BackgroundColor3 = COLORS.LOCKED
+		uiRefs.lockShackle.Position = UDim2.fromOffset(4, 3) -- Khớp sát thân khóa
+		uiRefs.floatStroke.Color = COLORS.LOCKED
+	else
+		uiRefs.lockStroke.Color = COLORS.UNLOCKED
+		uiRefs.shackleStroke.Color = COLORS.UNLOCKED
+		uiRefs.lockBody.BackgroundColor3 = COLORS.UNLOCKED
+		uiRefs.lockShackle.Position = UDim2.fromOffset(4, 0) -- Nhấc móc khóa lên
+		uiRefs.floatStroke.Color = COLORS.ACCENT
+	end
+end
+
+local function updateAutoButtonVisuals()
+	if state.destroyed or not uiRefs.autoButton then
+		return
+	end
+	if state.autoRefresh then
+		uiRefs.autoButton.Text = "AUTO: ON"
+		uiRefs.autoButton.TextColor3 = COLORS.ONLINE
+		uiRefs.autoStroke.Color = COLORS.ONLINE
+	else
+		uiRefs.autoButton.Text = "AUTO: OFF"
+		uiRefs.autoButton.TextColor3 = COLORS.TEXT_SECONDARY
+		uiRefs.autoStroke.Color = COLORS.BORDER
+	end
+end
+
+local function setBanner(text, color, borderColor)
+	if state.destroyed or not uiRefs.bannerText then
+		return
+	end
+	uiRefs.bannerText.Text = text
+	uiRefs.bannerText.TextColor3 = color or COLORS.TEXT_SECONDARY
+	uiRefs.bannerStroke.Color = borderColor or COLORS.BORDER
+end
+
+local function setMenuVisible(visible)
+	state.isMenuOpen = visible
+	if uiRefs.mainPanel then
+		uiRefs.mainPanel.Visible = visible
+	end
+end
+
+local function setLoadingState(loading)
+	state.isChecking = loading
+	if state.destroyed or not uiRefs.checkButton then
+		return
+	end
+	if loading then
+		uiRefs.checkButton.Text = "LOADING..."
+		uiRefs.checkButton.BackgroundColor3 = COLORS.ACCENT_DARK
+		uiRefs.checkButton.TextColor3 = COLORS.TEXT_PRIMARY
+		setBanner("LOADING... Đang truy vấn dữ liệu từ Roblox API", COLORS.UNKNOWN, COLORS.UNKNOWN)
+	else
+		uiRefs.checkButton.Text = "CHECK"
+		uiRefs.checkButton.BackgroundColor3 = COLORS.ACCENT
+		uiRefs.checkButton.TextColor3 = COLORS.BG_MAIN
+	end
+end
+
+local function renderResult(result)
+	if state.destroyed or not uiRefs.usernameLine then
+		return
+	end
+
+	uiRefs.usernameLine.Text = "Username: " .. tostring(result.username)
+	uiRefs.displayNameLine.Text = "Display Name: " .. tostring(result.displayName)
+	uiRefs.userIdLine.Text = "UserId: " .. tostring(result.userIdText)
+	uiRefs.statusLine.Text = "STATUS: " .. tostring(result.status)
+	uiRefs.expValueLine.Text = tostring(result.experience)
+	uiRefs.lastCheckValueLine.Text = tostring(result.lastCheck)
+
+	if result.status == "ONLINE" then
+		uiRefs.statusLine.TextColor3 = COLORS.ONLINE
+		uiRefs.floatStatusDot.BackgroundColor3 = COLORS.ONLINE
+	elseif result.status == "OFFLINE" then
+		uiRefs.statusLine.TextColor3 = COLORS.OFFLINE
+		uiRefs.floatStatusDot.BackgroundColor3 = COLORS.OFFLINE
+	else
+		uiRefs.statusLine.TextColor3 = COLORS.UNKNOWN
+		uiRefs.floatStatusDot.BackgroundColor3 = COLORS.UNKNOWN
+	end
+
+	if result.errorMessage and result.errorMessage ~= "" then
+		uiRefs.errorDetailLine.Text = "Lý do / Lỗi: " .. tostring(result.errorMessage)
+		uiRefs.errorDetailLine.Visible = true
+		setBanner("Lỗi: " .. tostring(result.errorMessage), COLORS.OFFLINE, COLORS.OFFLINE)
+	else
+		uiRefs.errorDetailLine.Text = ""
+		uiRefs.errorDetailLine.Visible = false
+		if state.autoRefresh and state.activeTargetUsername ~= "" then
+			setBanner("Cập nhật thành công. Tự động làm mới sau " .. tostring(CONFIG.AUTO_REFRESH_INTERVAL) .. "s.", COLORS.ONLINE, COLORS.BORDER)
+		else
+			setBanner("Kiểm tra hoàn tất lúc " .. tostring(result.lastCheck), COLORS.ONLINE, COLORS.BORDER)
+		end
+	end
+end
+
+local function executeCheck(rawUsername, isManual)
+	if state.destroyed then
+		return
+	end
+
+	local cleanName = normalizeUsername(rawUsername)
+	local now = os.clock()
+
+	if isManual then
+		local remain = CONFIG.MANUAL_COOLDOWN - (now - state.lastManualCheckTime)
+		if remain > 0 then
+			setBanner(string.format("Vui lòng đợi %.1fs trước lần kiểm tra tiếp theo.", remain), COLORS.UNKNOWN, COLORS.UNKNOWN)
+			return
+		end
+		if state.isChecking then
+			setBanner("Đang kiểm tra, vui lòng chờ hoàn tất...", COLORS.UNKNOWN, COLORS.UNKNOWN)
+			return
+		end
+		state.lastManualCheckTime = now
+	else
+		if state.isChecking then
+			return
+		end
+	end
+
+	if cleanName == "" then
+		state.activeTargetUsername = ""
+		renderResult(resolvePlayerStatus(""))
+		return
+	end
+
+	state.activeTargetUsername = cleanName
+	state.activeRequestId += 1
+	local currentRequestId = state.activeRequestId
+
+	setLoadingState(true)
+
+	task.spawn(function()
+		local result = resolvePlayerStatus(cleanName)
+		if state.destroyed or currentRequestId ~= state.activeRequestId then
+			return
+		end
+
+		setLoadingState(false)
+		if result.shouldStopAuto then
+			state.activeTargetUsername = ""
+		end
+		renderResult(result)
+
+		local interval = result.rateLimited and CONFIG.RATE_LIMIT_BACKOFF or CONFIG.AUTO_REFRESH_INTERVAL
+		state.nextAutoCheckTime = os.clock() + interval
+	end)
+end
+
+local function updateResponsiveLayout()
+	if state.destroyed or not uiRefs.mainPanel or not uiRefs.floatingContainer then
+		return
+	end
+	local vp = getViewportSize()
+	local newW = math.clamp(vp.X - 24, 260, 380)
+	local newH = math.clamp(vp.Y - 36, 300, 468)
+	uiRefs.mainPanel.Size = UDim2.fromOffset(newW, newH)
+
+	local curPanelPos = uiRefs.mainPanel.AbsolutePosition
+	local clampedPX, clampedPY = clampPositionToScreen(curPanelPos.X, curPanelPos.Y, newW, newH, CONFIG.SCREEN_MARGIN)
+	uiRefs.mainPanel.Position = UDim2.fromOffset(clampedPX, clampedPY)
+
+	local floatSize = uiRefs.floatingContainer.AbsoluteSize
+	local curFloatPos = uiRefs.floatingContainer.AbsolutePosition
+	local clampedFX, clampedFY = clampPositionToScreen(curFloatPos.X, curFloatPos.Y, floatSize.X, floatSize.Y, CONFIG.SCREEN_MARGIN)
+	uiRefs.floatingContainer.Position = UDim2.fromOffset(clampedFX, clampedFY)
+end
+
+local function bindCameraResizeListener()
+	local camConn = nil
+	local function attachToCamera()
+		if camConn then
+			pcall(function()
+				camConn:Disconnect()
+			end)
+			camConn = nil
+		end
+		local cam = workspace.CurrentCamera
+		if cam then
+			camConn = trackConnection(cam:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+				updateResponsiveLayout()
+			end))
+		end
+	end
+
+	attachToCamera()
+	trackConnection(workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+		attachToCamera()
+		updateResponsiveLayout()
+	end))
+end
+
+local function bindEvents()
+	-- 1. Nút nổi: Nhấn để đóng/mở menu (luôn hoạt động kể cả khi đang khóa), kéo để di chuyển khi mở khóa
+	bindDragAndTap(uiRefs.floatingButton, uiRefs.floatingContainer, {
+		canDrag = function()
+			return not state.isLocked
+		end,
+		onTap = function()
+			setMenuVisible(not state.isMenuOpen)
+		end,
+	})
+
+	-- 2. Nút ổ khóa: Độc lập hoàn toàn với nút nổi, chỉ khóa/mở khóa việc di chuyển nút nổi
+	trackConnection(uiRefs.lockButton.Activated:Connect(function()
+		if state.destroyed then
+			return
+		end
+		state.isLocked = not state.isLocked
+		updateLockVisuals()
+	end))
+
+	-- 3. Thanh tiêu đề: Kéo bảng giao diện chính
+	bindDragAndTap(uiRefs.titleBar, uiRefs.mainPanel, {
+		canDrag = function()
+			return true
+		end,
+		onTap = nil,
+	})
+
+	-- 4. Nút X: Đóng giao diện chính (không làm hỏng nút nổi)
+	trackConnection(uiRefs.closeButton.Activated:Connect(function()
+		if state.destroyed then
+			return
+		end
+		setMenuVisible(false)
+	end))
+
+	-- 5. Nút CHECK & phím Enter trong ô nhập username
+	trackConnection(uiRefs.checkButton.Activated:Connect(function()
+		if state.destroyed then
+			return
+		end
+		executeCheck(uiRefs.usernameBox.Text, true)
+	end))
+
+	trackConnection(uiRefs.usernameBox.FocusLost:Connect(function(enterPressed)
+		if state.destroyed then
+			return
+		end
+		if enterPressed then
+			executeCheck(uiRefs.usernameBox.Text, true)
+		end
+	end))
+
+	-- 6. Nút bật/tắt tự động cập nhật liên tục
+	trackConnection(uiRefs.autoButton.Activated:Connect(function()
+		if state.destroyed then
+			return
+		end
+		state.autoRefresh = not state.autoRefresh
+		updateAutoButtonVisuals()
+		if state.autoRefresh and state.activeTargetUsername ~= "" then
+			state.nextAutoCheckTime = os.clock() + CONFIG.AUTO_REFRESH_INTERVAL
+			setBanner("Đã bật tự động cập nhật (" .. tostring(CONFIG.AUTO_REFRESH_INTERVAL) .. "s/lần).", COLORS.ONLINE, COLORS.BORDER)
+		elseif not state.autoRefresh then
+			setBanner("Đã tắt tự động cập nhật. Nhấn CHECK để kiểm tra thủ công.", COLORS.TEXT_SECONDARY, COLORS.BORDER)
+		end
+	end))
+
+	bindCameraResizeListener()
+end
+
+local function startAutoRefreshLoop()
+	task.spawn(function()
+		while not state.destroyed do
+			task.wait(1)
+			if state.destroyed then
+				break
+			end
+
+			if state.autoRefresh and state.activeTargetUsername ~= "" and not state.isChecking then
+				local remaining = math.ceil(state.nextAutoCheckTime - os.clock())
+				if remaining <= 0 then
+					executeCheck(state.activeTargetUsername, false)
+				else
+					-- Hiển thị bộ đếm ngược nhẹ khi không có lỗi đang hiển thị
+					if uiRefs.errorDetailLine and not uiRefs.errorDetailLine.Visible then
+						setBanner("Cập nhật liên tục: làm mới sau " .. tostring(remaining) .. "s", COLORS.TEXT_SECONDARY, COLORS.BORDER)
+					end
+				end
+			end
+		end
+	end)
+end
+
+--==============================================================================
+-- 8. KHỞI CHẠY CHÍNH
+--==============================================================================
+local built = buildUI()
+if built then
+	updateLockVisuals()
+	updateAutoButtonVisuals()
+	bindEvents()
+	startAutoRefreshLoop()
+
+	-- Kiểm tra sẵn khả năng HTTP khi mở để cảnh báo sớm nếu chạy trong môi trường không hỗ trợ
+	if not detectHttpRequest() then
+		setBanner("Cảnh báo: Môi trường này không hỗ trợ HTTP request.", COLORS.UNKNOWN, COLORS.UNKNOWN)
+	end
+end
